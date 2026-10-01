@@ -9,6 +9,19 @@
         .container { max-width: 1480px; margin: 0 auto; }
         h1, h2 { color: #38bdf8; margin-top: 0; }
         .card { background: #1e293b; border-radius: 8px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; }
+        
+        /* Tabs */
+        .tabs { display: flex; gap: 8px; border-bottom: 2px solid #334155; margin-bottom: 20px; }
+        .tab-btn { background: transparent; color: #94a3b8; border: none; padding: 12px 24px; cursor: pointer; font-size: 16px; font-weight: bold; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+        .tab-btn.active { color: #38bdf8; border-bottom: 2px solid #38bdf8; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Stats Grid */
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+        .stat-box { background: #111827; border: 1px solid #374151; border-radius: 8px; padding: 20px; text-align: center; }
+        .stat-num { font-size: 32px; font-weight: bold; color: #38bdf8; margin-top: 8px; }
+
         .policy-group { display: flex; gap: 16px; margin-top: 10px; }
         .policy-btn { padding: 10px 18px; border-radius: 6px; border: 1px solid #475569; background: #334155; color: #fff; cursor: pointer; font-weight: bold; }
         .policy-btn.active { background: #0284c7; border-color: #38bdf8; }
@@ -21,19 +34,16 @@
         .badge-clean { background: #065f46; color: #34d399; border: 1px solid #059669; }
         .badge-uncertain { background: #854d0e; color: #facc15; border: 1px solid #ca8a04; }
         .badge-leak { background: #991b1b; color: #f87171; border: 1px solid #dc2626; }
-        
         .badge-ext { background: #7c2d12; color: #fdba74; border: 1px solid #ea580c; }
         .badge-local { background: #1e1b4b; color: #c7d2fe; border: 1px solid #4338ca; }
-        
         .badge-mode-local { background: #064e3b; color: #6ee7b7; border: 1px solid #059669; }
         .badge-mode-hybrid { background: #4c1d95; color: #ddd6fe; border: 1px solid #7c3aed; }
         
         pre { background: #0f172a; padding: 10px; border-radius: 6px; overflow-x: auto; max-height: 180px; white-space: pre-wrap; font-size: 13px; border: 1px solid #334155; margin: 0; }
         .evaluator-box { background: #172554; border-left: 3px solid #38bdf8; padding: 10px; border-radius: 4px; font-size: 13px; color: #e0f2fe; }
-        .btn-approve { background: #059669; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 6px; }
-        .btn-approve:hover { background: #047857; }
-        .btn-reject { background: #dc2626; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; }
-        .btn-reject:hover { background: #b91c1c; }
+        .btn-approve, .btn-reject { color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 6px; }
+        .btn-approve { background: #059669; } .btn-approve:hover { background: #047857; }
+        .btn-reject { background: #dc2626; margin-bottom: 0; } .btn-reject:hover { background: #b91c1c; }
         .sub-meta { color: #94a3b8; font-size: 11px; margin-top: 4px; }
         
         .turn-card { background: #111827; border: 1px solid #374151; border-radius: 8px; margin-bottom: 16px; overflow: hidden; }
@@ -42,7 +52,8 @@
         .turn-query { font-size: 14px; font-weight: bold; color: #f8fafc; max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .turn-metrics { display: flex; gap: 10px; font-size: 12px; align-items: center; }
         .metric-pill { background: #374151; padding: 4px 8px; border-radius: 4px; color: #94a3b8; }
-        .token-pill { background: #172554; color: #60a5fa; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-right: 6px; }
+        .token-pill { background: #172554; color: #60a5fa; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+        
         .turn-body { padding: 16px; display: none; background: #0b1120; border-top: 1px solid #374151; }
         .turn-body.open { display: block; }
         
@@ -60,59 +71,126 @@
 <body>
     <div class="container">
         <h1>BorrowModel Control Plane</h1>
-        <div style="font-size: 13px; color: #94a3b8; margin-bottom: 20px;">
+        <div style="font-size: 13px; color: #94a3b8; margin-bottom: 10px;">
             Enclave Loopback: <strong>127.0.0.1:9908</strong> | Air-Gap Mode: <strong>Strict Dual-Vendor Verification</strong>
         </div>
-        
-        <div class="card">
-            <h2>Egress Gating Policy</h2>
-            <div class="policy-group">
-                <button class="policy-btn" id="btn-manual" onclick="setPolicy('manual')">Manual-Approve All</button>
-                <button class="policy-btn" id="btn-confidence" onclick="setPolicy('confidence')">Confidence-Based (Clean Passes, Uncertain Queues)</button>
-                <button class="policy-btn" id="btn-auto" onclick="setPolicy('auto')">Auto-Approve All</button>
-            </div>
+
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('traces')">Execution Traces</button>
+            <button class="tab-btn" onclick="switchTab('tokens')">Token Statistics</button>
         </div>
 
-        <div class="card">
-            <h2>Pending Outgoing Approval Queue (<span id="queue-count">0</span>)</h2>
-            <div id="queue-container">Loading queue...</div>
-        </div>
-
-        <div class="card">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <h2>Message Turn Traces (User Queries Grouped with Sub-Requests)</h2>
-                <div>
-                    <label style="font-size: 13px; color: #94a3b8;">Turns per page: </label>
-                    <select class="page-select" id="page-size-select" onchange="changePageSize()">
-                        <option value="5">5</option>
-                        <option value="10" selected>10</option>
-                        <option value="25">25</option>
-                        <option value="50">50</option>
-                    </select>
+        <!-- TAB 1: EXECUTION TRACES -->
+        <div id="tab-traces" class="tab-content active">
+            <div class="card">
+                <h2>Egress Gating Policy</h2>
+                <div class="policy-group">
+                    <button class="policy-btn" id="btn-manual" onclick="setPolicy('manual')">Manual-Approve All</button>
+                    <button class="policy-btn" id="btn-confidence" onclick="setPolicy('confidence')">Confidence-Based (Clean Passes, Uncertain Queues)</button>
+                    <button class="policy-btn" id="btn-auto" onclick="setPolicy('auto')">Auto-Approve All</button>
                 </div>
             </div>
 
-            <div id="logs-container" style="margin-top:16px;">Loading traces...</div>
+            <div class="card">
+                <h2>Pending Outgoing Approval Queue (<span id="queue-count">0</span>)</h2>
+                <div id="queue-container">Loading queue...</div>
+            </div>
 
-            <div class="pager-bar">
-                <div style="font-size: 13px; color: #94a3b8;">
-                    Showing page <span id="current-page-label">1</span> of <span id="total-pages-label">1</span> 
-                    (<span id="total-items-label">0</span> total user messages)
+            <div class="card">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h2>Message Turn Traces (Live Updates)</h2>
+                    <div>
+                        <label style="font-size: 13px; color: #94a3b8;">Turns per page: </label>
+                        <select class="page-select" id="page-size-select" onchange="changePageSize('traces')">
+                            <option value="5">5</option>
+                            <option value="10" selected>10</option>
+                            <option value="25">25</option>
+                        </select>
+                    </div>
                 </div>
-                <div class="pager-controls">
-                    <button class="pager-btn" id="prev-btn" onclick="prevPage()">Previous</button>
-                    <button class="pager-btn" id="next-btn" onclick="nextPage()">Next</button>
+                <div id="logs-container" style="margin-top:16px;">Loading traces...</div>
+                <div class="pager-bar">
+                    <div style="font-size: 13px; color: #94a3b8;">Page <span id="current-page-label">1</span> of <span id="total-pages-label">1</span> (<span id="total-items-label">0</span> total turns)</div>
+                    <div class="pager-controls">
+                        <button class="pager-btn" id="prev-btn" onclick="prevPage('traces')">Previous</button>
+                        <button class="pager-btn" id="next-btn" onclick="nextPage('traces')">Next</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB 2: TOKEN STATISTICS -->
+        <div id="tab-tokens" class="tab-content">
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Total Prompt Tokens</div>
+                    <div class="stat-num" id="stat-prompt">0</div>
+                </div>
+                <div class="stat-box">
+                    <div style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Total Completion Tokens</div>
+                    <div class="stat-num" id="stat-comp">0</div>
+                </div>
+                <div class="stat-box">
+                    <div style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Total Tokens Egressed</div>
+                    <div class="stat-num" id="stat-total">0</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h2>Turn-Level Token Ledger</h2>
+                    <div>
+                        <label style="font-size: 13px; color: #94a3b8;">Turns per page: </label>
+                        <select class="page-select" id="token-page-size-select" onchange="changePageSize('tokens')">
+                            <option value="10">10</option>
+                            <option value="25" selected>25</option>
+                            <option value="50">50</option>
+                        </select>
+                    </div>
+                </div>
+                <table id="token-table">
+                    <tr>
+                        <th style="width: 25%;">Turn ID</th>
+                        <th style="width: 15%;">Time</th>
+                        <th style="width: 15%;">Prompt</th>
+                        <th style="width: 15%;">Completion</th>
+                        <th style="width: 15%;">Total</th>
+                        <th style="width: 15%;">Breakdown</th>
+                    </tr>
+                    <tbody id="token-table-body"></tbody>
+                </table>
+                <div class="pager-bar">
+                    <div style="font-size: 13px; color: #94a3b8;">Page <span id="t-current-page-label">1</span> of <span id="t-total-pages-label">1</span></div>
+                    <div class="pager-controls">
+                        <button class="pager-btn" id="t-prev-btn" onclick="prevPage('tokens')">Previous</button>
+                        <button class="pager-btn" id="t-next-btn" onclick="nextPage('tokens')">Next</button>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
-        let currentPage = 1;
-        let pageSize = 10;
-        let openTurns = new Set();
+        let currentTab = 'traces';
+        let tracePage = 1;
+        let tracePageSize = 10;
+        let tokenPage = 1;
+        let tokenPageSize = 25;
+
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            document.querySelector(`.tab-btn[onclick="switchTab('${tabName}')"]`).classList.add('active');
+            document.getElementById(`tab-${tabName}`).classList.add('active');
+            currentTab = tabName;
+            if(tabName === 'traces') fetchLogs();
+            if(tabName === 'tokens') fetchTokens();
+        }
+
+        function escapeHtml(str) { return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
         async function fetchQueueState() {
+            if (currentTab !== 'traces') return;
             try {
                 const res = await fetch('/api/state');
                 const data = await res.json();
@@ -127,177 +205,174 @@
                 if (data.queue.length === 0) {
                     qContainer.innerHTML = "<p style='color:#94a3b8;'>No pending requests awaiting approval.</p>";
                 } else {
-                    let html = `<table><tr>
-                        <th style="width: 14%;">Target & Spec</th>
-                        <th style="width: 38%;">Candidate Prompt to Wire</th>
-                        <th style="width: 36%;">Evaluator Diagnosis (Audit Model)</th>
-                        <th style="width: 12%;">Action</th>
-                    </tr>`;
+                    let html = `<table><tr><th style="width:14%">Target & Spec</th><th style="width:38%">Candidate Prompt to Wire</th><th style="width:36%">Evaluator Diagnosis (Audit Model)</th><th style="width:12%">Action</th></tr>`;
                     data.queue.forEach(item => {
                         let badgeClass = item.certainty === 'high_certainty_clean' ? 'badge-clean' : (item.certainty === 'uncertain' ? 'badge-uncertain' : 'badge-leak');
                         html += `<tr>
-                            <td>
-                                <strong>${item.target_provider}</strong><br>
-                                <span class="badge ${badgeClass}" style="margin-top:4px;">${item.certainty}</span>
-                                <div class="sub-meta">Spec: ${item.spec_type.toUpperCase()}<br>Round: ${item.round_idx || 1}</div>
-                            </td>
+                            <td><strong>${item.target_provider}</strong><br><span class="badge ${badgeClass}" style="margin-top:4px;">${item.certainty}</span><div class="sub-meta">Spec: ${item.spec_type.toUpperCase()}<br>Round: ${item.round_idx || 1}</div></td>
                             <td><pre>${escapeHtml(item.prompt_text)}</pre></td>
-                            <td>
-                                <div class="evaluator-box">
-                                    <strong>Assessment:</strong> ${escapeHtml(item.audit_notes)}
-                                    ${item.evaluator_raw_response ? `
-                                    <details style="margin-top:8px;">
-                                        <summary>View Raw Evaluator CoT</summary>
-                                        <pre style="margin-top:6px; max-height:100px;">${escapeHtml(item.evaluator_raw_response)}</pre>
-                                    </details>` : ''}
-                                </div>
-                            </td>
-                            <td>
-                                <button class="btn-approve" onclick="resolve('${item.id}', 'approve')">Approve</button>
-                                <button class="btn-reject" onclick="resolve('${item.id}', 'reject')">Reject</button>
-                            </td>
+                            <td><div class="evaluator-box"><strong>Assessment:</strong> ${escapeHtml(item.audit_notes)}${item.evaluator_raw_response ? `<details style="margin-top:8px;"><summary>Raw Evaluator CoT</summary><pre style="margin-top:6px; max-height:100px;">${escapeHtml(item.evaluator_raw_response)}</pre></details>` : ''}</div></td>
+                            <td><button class="btn-approve" onclick="resolve('${item.id}', 'approve')">Approve</button><button class="btn-reject" onclick="resolve('${item.id}', 'reject')">Reject</button></td>
                         </tr>`;
                     });
                     html += "</table>";
                     qContainer.innerHTML = html;
                 }
-            } catch (err) {
-                console.error("Queue fetch error:", err);
-            }
+            } catch (err) { console.error("Queue error:", err); }
         }
 
         async function fetchLogs() {
+            if (currentTab !== 'traces') return;
             try {
-                const res = await fetch(`/api/logs?page=${currentPage}&page_size=${pageSize}`);
+                const res = await fetch(`/api/logs?page=${tracePage}&page_size=${tracePageSize}`);
                 const resData = await res.json();
                 
                 document.getElementById('current-page-label').innerText = resData.page;
                 document.getElementById('total-pages-label').innerText = resData.total_pages;
                 document.getElementById('total-items-label').innerText = resData.total_turns;
-
                 document.getElementById('prev-btn').disabled = resData.page <= 1;
                 document.getElementById('next-btn').disabled = resData.page >= resData.total_pages;
 
                 const lContainer = document.getElementById('logs-container');
-                if (resData.data.length === 0) {
-                    lContainer.innerHTML = "<p style='color:#94a3b8;'>No message turns logged yet.</p>";
-                    return;
-                }
+                if (resData.data.length === 0) { lContainer.innerHTML = "<p style='color:#94a3b8;'>No message turns logged yet.</p>"; return; }
 
-                let html = "";
+                // Virtual DOM-lite diffing to prevent UI collapse/flickering
+                let existingIds = Array.from(lContainer.children).map(c => c.id);
+                let newIds = resData.data.map(t => `turn-${t.turn_id}`);
+                existingIds.forEach(id => { if (!newIds.includes(id)) document.getElementById(id).remove(); });
+
                 resData.data.forEach((turn, idx) => {
                     const dateStr = new Date(turn.created_at * 1000).toLocaleTimeString();
                     const m = turn.metrics;
                     const isLocalOnly = turn.routing_mode === 'LOCAL_ONLY';
-                    const modeBadge = isLocalOnly 
-                        ? '<span class="badge badge-mode-local">LOCAL ENCLAVE ONLY</span>' 
-                        : '<span class="badge badge-mode-hybrid">HYBRID EGRESS</span>';
-
-                    html += `
-                    <div class="turn-card">
-                        <div class="turn-header ${isLocalOnly ? 'local-only' : ''}" onclick="toggleTurn('t-${idx}')">
+                    const modeBadge = isLocalOnly ? '<span class="badge badge-mode-local">LOCAL ENCLAVE ONLY</span>' : '<span class="badge badge-mode-hybrid">HYBRID EGRESS</span>';
+                    
+                    let htmlStr = `
+                        <div class="turn-header ${isLocalOnly ? 'local-only' : ''}" onclick="toggleTurn('body-${turn.turn_id}')">
                             <div style="display:flex; flex-direction:column; gap:4px; max-width:65%;">
-                                <div style="display:flex; align-items:center; gap:8px;">
-                                    ${modeBadge}
-                                    <span class="turn-query">${escapeHtml(turn.raw_query)}</span>
-                                </div>
+                                <div style="display:flex; align-items:center; gap:8px;">${modeBadge}<span class="turn-query">${escapeHtml(turn.raw_query)}</span></div>
                                 <div style="font-size:11px; color:#64748b;">Turn ID: ${turn.turn_id} | ${dateStr}</div>
                             </div>
                             <div class="turn-metrics">
-                                <span class="metric-pill">📡 Outbound Egress: <strong style="color:${m.external_count > 0 ? '#fdba74' : '#64748b'};">${m.external_count}</strong></span>
-                                <span class="metric-pill">🔒 Local Operations: <strong style="color:#c7d2fe;">${m.local_count}</strong></span>
-                                <span class="metric-pill">⏱️ Total: <strong>${m.total_latency_ms}ms</strong></span>
+                                <span class="metric-pill">📡 External: <strong style="color:${m.external_count > 0 ? '#fdba74' : '#64748b'};">${m.external_count}</strong></span>
+                                <span class="metric-pill">🔒 Local: <strong style="color:#c7d2fe;">${m.local_count}</strong></span>
+                                <span class="metric-pill">🪙 Tokens: <strong style="color:#38bdf8;">${m.total_tokens}</strong></span>
                                 <span class="metric-pill" style="color:${turn.status.startsWith('FAILED') ? '#f87171' : '#34d399'}">${turn.status}</span>
                             </div>
                         </div>
-                        <div class="turn-body" id="t-${idx}">
-                            <div style="margin-bottom:12px; font-size:12px; color:#94a3b8;">
-                                <strong>Sub-Request Execution Pipeline (${turn.routing_mode}):</strong>
-                            </div>`;
+                        <div class="turn-body" id="body-${turn.turn_id}">
+                            <div style="margin-bottom:12px; font-size:12px; color:#94a3b8;"><strong>Sub-Request Execution Pipeline:</strong></div>`;
                     
                     turn.subrequests.forEach((sub) => {
                         const isExt = sub.is_external === 1;
                         const badgeType = isExt ? 'badge-ext' : 'badge-local';
-                        const typeLabel = isExt ? 'EXTERNAL EGRESS' : 'LOCAL ENCLAVE';
                         let certBadge = sub.certainty !== 'N/A' ? `<span class="badge ${sub.certainty === 'high_certainty_clean' ? 'badge-clean' : 'badge-uncertain'}">${sub.certainty}</span>` : '';
-                        let tokenString = sub.total_tokens > 0 ? `<span class="token-pill">Tokens: ${sub.prompt_tokens}↓ + ${sub.completion_tokens}↑ = ${sub.total_tokens}</span>` : "";
+                        let tokStr = sub.total_tokens > 0 ? `<span class="token-pill">${sub.prompt_tokens}↓ + ${sub.completion_tokens}↑ = ${sub.total_tokens}</span>` : "";
 
-                        html += `
+                        htmlStr += `
                             <div class="timeline-step ${isExt ? '' : 'local-node'}">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                                    <div>
-                                        <span class="badge ${badgeType}">Step ${sub.step_order}: ${sub.phase_type}</span>
-                                        <span style="font-size:12px; color:#94a3b8; margin-left:6px;">[${typeLabel}] ➔ ${escapeHtml(sub.target_engine)}</span>
-                                    </div>
-                                    <div style="font-size:11px; color:#64748b; display: flex; align-items: center;">
-                                        ${tokenString} Latency: ${sub.latency_ms > 0 ? sub.latency_ms + 'ms' : 'Gating'} | Status: <strong style="margin-left:4px;">${sub.status}</strong>
+                                    <div><span class="badge ${badgeType}">Step ${sub.step_order}: ${sub.phase_type}</span><span style="font-size:12px; color:#94a3b8; margin-left:6px;">➔ ${escapeHtml(sub.target_engine)}</span></div>
+                                    <div style="font-size:11px; color:#64748b; display:flex; align-items:center;">
+                                        ${tokStr} Latency: ${sub.latency_ms > 0 ? sub.latency_ms + 'ms' : 'Gating'} | Status: <strong style="margin-left:4px;">${sub.status}</strong>
                                     </div>
                                 </div>
                                 <table>
-                                    <tr>
-                                        <th style="width:50%;">Inbound Prompt Payload</th>
-                                        <th style="width:50%;">Response / Diagnosis</th>
-                                    </tr>
+                                    <tr><th style="width:50%;">Inbound Prompt Payload</th><th style="width:50%;">Response / Diagnosis</th></tr>
                                     <tr>
                                         <td><pre>${escapeHtml(sub.prompt)}</pre></td>
                                         <td>
-                                            ${sub.response ? `<pre>${escapeHtml(sub.response)}</pre>` : '<em style="color:#64748b;">(No response payload / Gating Step)</em>'}
+                                            ${sub.response ? `<pre>${escapeHtml(sub.response)}</pre>` : '<em style="color:#64748b;">(No response payload)</em>'}
                                             ${sub.audit_notes ? `<div class="sub-meta" style="margin-top:6px;">${certBadge} <strong>Audit:</strong>${escapeHtml(sub.audit_notes)}</div>` : ''}
                                         </td>
                                     </tr>
                                 </table>
                             </div>`;
                     });
+                    htmlStr += `</div>`;
 
-                    html += `
-                        </div>
-                    </div>`;
+                    let statusHash = turn.status + turn.metrics.total_subrequests + turn.metrics.total_tokens;
+                    let existingCard = document.getElementById(`turn-${turn.turn_id}`);
+                    
+                    if (!existingCard) {
+                        let card = document.createElement('div');
+                        card.className = "turn-card";
+                        card.id = `turn-${turn.turn_id}`;
+                        card.setAttribute('data-hash', statusHash);
+                        card.innerHTML = htmlStr;
+                        lContainer.appendChild(card); // Append to bottom
+                    } else if (existingCard.getAttribute('data-hash') !== statusHash) {
+                        // Update gracefully preserving open state
+                        let bodyElem = document.getElementById(`body-${turn.turn_id}`);
+                        let isOpen = bodyElem && bodyElem.classList.contains('open');
+                        existingCard.setAttribute('data-hash', statusHash);
+                        existingCard.innerHTML = htmlStr;
+                        if (isOpen) document.getElementById(`body-${turn.turn_id}`).classList.add('open');
+                    }
                 });
-                lContainer.innerHTML = html;
+            } catch (err) { console.error("Log error:", err); }
+        }
 
-                // Restore previously opened UI dropdowns natively
-                openTurns.forEach(id => {
-                    const el = document.getElementById(id);
-                    if (el) el.classList.add('open');
-                });
+        async function fetchTokens() {
+            if (currentTab !== 'tokens') return;
+            try {
+                const res = await fetch(`/api/tokens?page=${tokenPage}&page_size=${tokenPageSize}`);
+                const data = await res.json();
                 
-            } catch (err) {
-                console.error("Log fetch error:", err);
-            }
+                document.getElementById('stat-prompt').innerText = data.totals.prompt.toLocaleString();
+                document.getElementById('stat-comp').innerText = data.totals.completion.toLocaleString();
+                document.getElementById('stat-total').innerText = data.totals.total.toLocaleString();
+                
+                document.getElementById('t-current-page-label').innerText = data.page;
+                document.getElementById('t-total-pages-label').innerText = data.total_pages;
+                document.getElementById('t-prev-btn').disabled = data.page <= 1;
+                document.getElementById('t-next-btn').disabled = data.page >= data.total_pages;
+
+                let tBody = document.getElementById('token-table-body');
+                tBody.innerHTML = "";
+                data.data.forEach(t => {
+                    let tr = document.createElement('tr');
+                    let timeStr = new Date(t.started * 1000).toLocaleTimeString();
+                    
+                    let breakdownHtml = `<details><summary style="cursor:pointer; color:#38bdf8;">View Breakdown</summary><div style="margin-top:8px; font-size:11px;">`;
+                    t.subrequests.forEach(s => {
+                        if(s.total_tokens > 0) {
+                            breakdownHtml += `<div style="margin-bottom:4px;"><strong style="color:#c7d2fe;">${s.phase_type}</strong><br><span style="color:#94a3b8;">${s.prompt_tokens}p + ${s.completion_tokens}c = ${s.total_tokens}</span></div>`;
+                        }
+                    });
+                    breakdownHtml += `</div></details>`;
+                    
+                    tr.innerHTML = `
+                        <td style="font-size:12px; font-family:monospace;">${t.turn_id}</td>
+                        <td style="font-size:12px;">${timeStr}</td>
+                        <td>${t.prompt_tokens.toLocaleString()}</td>
+                        <td>${t.completion_tokens.toLocaleString()}</td>
+                        <td style="font-weight:bold; color:#38bdf8;">${t.total_tokens.toLocaleString()}</td>
+                        <td>${breakdownHtml}</td>
+                    `;
+                    tBody.appendChild(tr);
+                });
+            } catch(e) { console.error("Token API error", e); }
         }
 
         function toggleTurn(id) {
             const el = document.getElementById(id);
-            if (el) {
-                el.classList.toggle('open');
-                if (el.classList.contains('open')) {
-                    openTurns.add(id);
-                } else {
-                    openTurns.delete(id);
-                }
-            }
+            if (el) el.classList.toggle('open');
         }
 
-        function prevPage() {
-            if (currentPage > 1) {
-                currentPage--;
-                fetchLogs();
-            }
+        function prevPage(tab) {
+            if (tab === 'traces' && tracePage > 1) { tracePage--; fetchLogs(); }
+            if (tab === 'tokens' && tokenPage > 1) { tokenPage--; fetchTokens(); }
         }
 
-        function nextPage() {
-            currentPage++;
-            fetchLogs();
+        function nextPage(tab) {
+            if (tab === 'traces') { tracePage++; fetchLogs(); }
+            if (tab === 'tokens') { tokenPage++; fetchTokens(); }
         }
 
-        function changePageSize() {
-            pageSize = parseInt(document.getElementById('page-size-select').value);
-            currentPage = 1;
-            fetchLogs();
-        }
-
-        function escapeHtml(str) {
-            return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        function changePageSize(tab) {
+            if (tab === 'traces') { tracePageSize = parseInt(document.getElementById('page-size-select').value); tracePage = 1; fetchLogs(); }
+            if (tab === 'tokens') { tokenPageSize = parseInt(document.getElementById('token-page-size-select').value); tokenPage = 1; fetchTokens(); }
         }
 
         async function setPolicy(p) {
@@ -312,7 +387,10 @@
         }
 
         setInterval(fetchQueueState, 1500);
-        setInterval(fetchLogs, 5000);
+        setInterval(() => {
+            if (currentTab === 'traces') fetchLogs();
+            if (currentTab === 'tokens') fetchTokens();
+        }, 5000);
 
         fetchQueueState();
         fetchLogs();
