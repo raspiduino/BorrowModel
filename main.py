@@ -87,8 +87,7 @@ def init_db():
         )
     """)
     for col in ["prompt_tokens", "completion_tokens", "total_tokens"]:
-        try:
-            c.execute(f"ALTER TABLE turn_subrequests ADD COLUMN {col} INTEGER DEFAULT 0;")
+        try: c.execute(f"ALTER TABLE turn_subrequests ADD COLUMN {col} INTEGER DEFAULT 0;")
         except sqlite3.OperationalError: pass
     c.execute("CREATE INDEX IF NOT EXISTS idx_subreq_turn ON turn_subrequests(turn_id);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_turns_created ON user_turns(created_at DESC);")
@@ -154,6 +153,7 @@ class ProxyState:
         self.policy: GatePolicy = GatePolicy.MANUAL_APPROVE_ALL
         self.force_delegate: bool = False
         self.auto_redact: bool = True
+        self.enable_verifier: bool = True
         self.queue: Dict[str, QueueRecord] = {}
 
 state = ProxyState()
@@ -194,6 +194,9 @@ async def stream_llm(base_url: str, api_key: str, model: str, messages: List[Dic
                         if "choices" in data and data["choices"]:
                             d = data["choices"][0].get("delta", {})
                             c, r = d.get("content", ""), d.get("reasoning_content", "")
+                            # Prevent reasoning models from emitting tags that prematurely close our OWUI wrapper
+                            if c: c = c.replace("<think>", "").replace("</think>", "")
+                            if r: r = r.replace("<think>", "").replace("</think>", "")
                             if c or r: yield c, r, None
                         if "usage" in data and data["usage"]: final_usage = data["usage"]
                     except: pass
@@ -206,7 +209,6 @@ async def evaluate_audit_certainty(abstract_prompt: str, turn_id: str, step_orde
         "You must ONLY flag explicit proprietary identifiers, internal project names, company names, or explicit proprietary scale/model parameters (e.g., '4B Qwen', 'Project Chimera', 'AWS Cluster').\n"
         "Respond STRICTLY in JSON format: {\"certainty\": \"high_certainty_clean\"|\"uncertain\"|\"flagged_leak\", \"notes\": \"...\"}"
     )
-    
     op_id = str(uuid.uuid4())
     try:
         raw_response, latency, usage = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": sys_prompt}, {"role": "user", "content": abstract_prompt}])
@@ -259,6 +261,8 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
     yield format_sse("<think>\n=== 1. LOCAL TRIAGE ===\n")
 
     try:
+        falsify_instruction = "\n===FALSIFICATION_SPEC===\n[Emit ONLY the stateless declarative proposition to falsify.]" if state.enable_verifier else ""
+        
         if state.force_delegate:
             triage_sys = (
                 "You are an air-gapped scientific lead architect. The system policy strictly FORCES this request to be delegated to external solvers.\n"
@@ -268,8 +272,8 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 "HOWEVER, you MUST preserve the concrete scientific or engineering domain mechanics. Do not over-generalize into pure abstract math if the problem relies on specific deep learning, physics, or engineering principles. "
                 "Keep standard industry terminology (e.g., 'transformer', 'MLP', 'gradient flow', 'autoregressive model'). For example, replace '4B Qwen-style transformer' with 'a standard autoregressive transformer'.\n\n"
                 "Format your output STRICTLY as:\n"
-                "===SOLVER_SPEC===\n[Emit ONLY the anonymized abstract problem statement. DO NOT solve it. Do NOT include intro labels.]\n"
-                "===FALSIFICATION_SPEC===\n[Emit ONLY the stateless declarative proposition to falsify.]"
+                "===SOLVER_SPEC===\n[Emit ONLY the anonymized abstract problem statement. DO NOT solve it. Do NOT include intro labels.]"
+                f"{falsify_instruction}"
             )
             yield format_sse("> Forced Egress Routing Engaged. Bypassing local assessment...\n")
         else:
@@ -281,28 +285,23 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 "HOWEVER, you MUST preserve the concrete scientific or engineering domain mechanics. Do not over-generalize into pure abstract math if the problem relies on specific deep learning, physics, or engineering principles. "
                 "Keep standard industry terminology (e.g., 'transformer', 'MLP', 'gradient flow', 'autoregressive model'). For example, replace '4B Qwen-style transformer' with 'a standard autoregressive transformer'.\n\n"
                 "Format your decision STRICTLY as:\nDECISION: [LOCAL or DELEGATE]\nREASON: [Brief justification]\n\n"
-                "If DELEGATE, append:\n===SOLVER_SPEC===\n[Emit ONLY the anonymized abstract problem statement. DO NOT solve it. Do NOT include intro labels.]\n===FALSIFICATION_SPEC===\n[Emit ONLY the stateless declarative proposition to falsify.]"
+                "If DELEGATE, append:\n===SOLVER_SPEC===\n[Emit ONLY the anonymized abstract problem statement. DO NOT solve it. Do NOT include intro labels.]"
+                f"{falsify_instruction}"
             )
 
-        triage_payload = build_payload(triage_sys, conversation_history, f"EVALUATE AND ROUTE THIS REQUEST:\n{user_query}")
-        
         triage_raw = ""
-        async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, triage_payload):
+        async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(triage_sys, conversation_history, f"EVALUATE AND ROUTE THIS REQUEST:\n{user_query}")):
             if c_reasoning: yield format_sse(c_reasoning)
-            if c_content:
-                triage_raw += c_content
-                yield format_sse(c_content)
+            if c_content: triage_raw += c_content; yield format_sse(c_content)
             if finish_data:
-                t_lat, t_usage = finish_data
-                await db_record_subrequest(str(uuid.uuid4()), turn_id, step, t_lat, "LOCAL_TRIAGE", False, f"Local ({LOCAL_MODEL_NAME})", user_query, triage_raw, "N/A", "Assessed routing", "COMPLETED", t_usage.get("prompt_tokens", 0), t_usage.get("completion_tokens", 0), t_usage.get("total_tokens", 0))
+                await db_record_subrequest(str(uuid.uuid4()), turn_id, step, finish_data[0], "LOCAL_TRIAGE", False, f"Local ({LOCAL_MODEL_NAME})", user_query, triage_raw, "N/A", "Assessed routing", "COMPLETED", finish_data[1].get("prompt_tokens", 0), finish_data[1].get("completion_tokens", 0), finish_data[1].get("total_tokens", 0))
         step += 1
 
         solver_spec, falsification_spec = extract_specs(triage_raw)
         
         if state.force_delegate:
             needs_delegation = True
-            if not solver_spec: 
-                solver_spec = re.sub(r"<think>.*?(</think>|$)", "", triage_raw, flags=re.DOTALL | re.IGNORECASE).strip()
+            if not solver_spec: solver_spec = re.sub(r"<think>.*?(</think>|$)", "", triage_raw, flags=re.DOTALL | re.IGNORECASE).strip()
         else:
             needs_delegation = bool(re.search(r"DECISION:\s*DELEGATE", triage_raw, re.IGNORECASE)) and bool(solver_spec)
 
@@ -321,35 +320,38 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 if finish_data: await db_record_subrequest(str(uuid.uuid4()), turn_id, step, finish_data[0], "LOCAL_EXECUTION", False, f"Local ({LOCAL_MODEL_NAME})", user_query, direct_ans, "N/A", "Initial local resolution", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
             step += 1
 
-            correction_round = 0
-            while correction_round < MAX_CORRECTION_ROUNDS:
-                correction_round += 1
-                if not thinking_open: yield format_sse(f"\n\n<think>\n=== AUDIT VERIFICATION (Round {correction_round}) ===\n"); thinking_open = True
-                else: yield format_sse(f"\n\n=== AUDIT VERIFICATION (Round {correction_round}) ===\n")
+            if state.enable_verifier:
+                correction_round = 0
+                while correction_round < MAX_CORRECTION_ROUNDS:
+                    correction_round += 1
+                    if not thinking_open: yield format_sse(f"\n\n<think>\n=== AUDIT VERIFICATION (Round {correction_round}) ===\n"); thinking_open = True
+                    else: yield format_sse(f"\n\n=== AUDIT VERIFICATION (Round {correction_round}) ===\n")
 
-                falsify_res = ""
-                async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": f"Analyze this explanation:\n\n{direct_ans[:2500]}\n\nIf an admissible flaw exists, output: 'VERDICT: FALSIFIED' and explain.\nIf unconditionally sound, output: 'VERDICT: SOUND'"}, {"role": "user", "content": direct_ans[:2000]}]):
-                    if c_reasoning: yield format_sse(c_reasoning)
-                    if c_content: falsify_res += c_content; yield format_sse(c_content)
-                    if finish_data: await db_record_subrequest(str(uuid.uuid4()), turn_id, step, finish_data[0], f"LOCAL_FALSIFICATION_CHECK_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", direct_ans[:500]+"...", falsify_res, "N/A", "Falsification round", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
-                step += 1
+                    falsify_res = ""
+                    async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": f"Analyze this explanation:\n\n{direct_ans[:2500]}\n\nIf an admissible flaw exists, output: 'VERDICT: FALSIFIED' and explain.\nIf unconditionally sound, output: 'VERDICT: SOUND'"}, {"role": "user", "content": direct_ans[:2000]}]):
+                        if c_reasoning: yield format_sse(c_reasoning)
+                        if c_content: falsify_res += c_content; yield format_sse(c_content)
+                        if finish_data: await db_record_subrequest(str(uuid.uuid4()), turn_id, step, finish_data[0], f"LOCAL_FALSIFICATION_CHECK_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", direct_ans[:500]+"...", falsify_res, "N/A", "Falsification round", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
+                    step += 1
 
-                if "VERDICT: FALSIFIED" in falsify_res:
-                    if correction_round < MAX_CORRECTION_ROUNDS:
-                        counterexample = falsify_res.split("VERDICT: FALSIFIED")[-1].strip()
-                        yield format_sse("\n\n=== RE-GENERATING SOLUTION ===\n")
-                        direct_ans = ""
-                        async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload("You are an expert scientific assistant.", conversation_history, f"ORIGINAL GOAL: {user_query}\n\nYOUR PREVIOUS ANSWER:\n{direct_ans}\n\nREFEREE'S REFUTATION:\n{counterexample}\n\nRe-answer comprehensively, explicitly resolving this counterexample.")):
-                            if c_reasoning: yield format_sse(c_reasoning)
-                            if c_content:
-                                if thinking_open: yield format_sse("\n</think>\n\n"); thinking_open = False
-                                direct_ans += c_content; yield format_sse(c_content)
-                            if finish_data: await db_record_subrequest(str(uuid.uuid4()), turn_id, step, finish_data[0], f"LOCAL_CORRECTION_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", counterexample, direct_ans, "N/A", "Corrected", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
-                        step += 1
-                    else:
-                        yield format_sse(f"\n\n⚠️ Boundary Warning: Unresolved after {MAX_CORRECTION_ROUNDS} rounds.\n")
-                        break
-                else: break
+                    if "VERDICT: FALSIFIED" in falsify_res:
+                        if correction_round < MAX_CORRECTION_ROUNDS:
+                            counterexample = falsify_res.split("VERDICT: FALSIFIED")[-1].strip()
+                            yield format_sse("\n\n=== RE-GENERATING SOLUTION ===\n")
+                            direct_ans = ""
+                            async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload("You are an expert scientific assistant.", conversation_history, f"ORIGINAL GOAL: {user_query}\n\nYOUR PREVIOUS ANSWER:\n{direct_ans}\n\nREFEREE'S REFUTATION:\n{counterexample}\n\nRe-answer comprehensively, explicitly resolving this counterexample.")):
+                                if c_reasoning: yield format_sse(c_reasoning)
+                                if c_content:
+                                    if thinking_open: yield format_sse("\n</think>\n\n"); thinking_open = False
+                                    direct_ans += c_content; yield format_sse(c_content)
+                                if finish_data: await db_record_subrequest(str(uuid.uuid4()), turn_id, step, finish_data[0], f"LOCAL_CORRECTION_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", counterexample, direct_ans, "N/A", "Corrected", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
+                            step += 1
+                        else:
+                            yield format_sse(f"\n\n⚠️ Boundary Warning: Unresolved after {MAX_CORRECTION_ROUNDS} rounds.\n")
+                            break
+                    else: break
+            else:
+                yield format_sse("\n> Referee verification disabled. Proceeding with unverified local answer...\n")
 
             if thinking_open: yield format_sse("\n</think>\n\n"); thinking_open = False
             await db_finish_turn(turn_id, "COMPLETED")
@@ -369,28 +371,39 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             correction_round += 1
             yield format_sse(f"\n=== EGRESS AUDIT (Round {correction_round}) ===\n")
 
-            if not falsification_spec:
+            if state.enable_verifier and not falsification_spec:
                 yield format_sse("> Synthesizing missing declarative proposition...\n")
-                falsification_spec, f_lat, f_usg = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": "Extract the core mathematical invariant proposition."}, {"role": "user", "content": solver_spec}])
+                falsification_spec, f_lat, f_usg = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": "Extract the core mathematical invariant proposition. DO NOT use meta-labels."}, {"role": "user", "content": solver_spec}])
+                await db_record_subrequest(str(uuid.uuid4()), turn_id, step, f_lat, f"PROPOSITION_SYNTHESIS_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", solver_spec, falsification_spec, "N/A", "Synthesized missing invariant", "COMPLETED", f_usg.get("prompt_tokens", 0), f_usg.get("completion_tokens", 0), f_usg.get("total_tokens", 0))
                 step += 1
 
             yield format_sse("> Auditing Prompts...\n")
             s_cert, s_notes, s_raw = await evaluate_audit_certainty(solver_spec, turn_id, step)
-            v_cert, v_notes, v_raw = await evaluate_audit_certainty(falsification_spec, turn_id, step + 1)
-            step += 2
+            step += 1
+            
+            if state.enable_verifier:
+                v_cert, v_notes, v_raw = await evaluate_audit_certainty(falsification_spec, turn_id, step)
+                step += 1
+            else:
+                v_cert, v_notes, v_raw = AuditCertainty.HIGH_CERTAINTY_CLEAN, "Verifier Disabled", ""
 
             # AUTO ACTOR-CRITIC REDACTION
             auto_redact_round = 0
-            while state.auto_redact and auto_redact_round < 2 and (s_cert != AuditCertainty.HIGH_CERTAINTY_CLEAN or v_cert != AuditCertainty.HIGH_CERTAINTY_CLEAN):
+            needs_redact = (s_cert != AuditCertainty.HIGH_CERTAINTY_CLEAN) or (state.enable_verifier and v_cert != AuditCertainty.HIGH_CERTAINTY_CLEAN)
+            while state.auto_redact and auto_redact_round < 2 and needs_redact:
                 auto_redact_round += 1
                 yield format_sse(f"\n> ⚠️ Internal Auditor flagged a potential leak (Auto-Redaction Phase {auto_redact_round}). Fixing...\n")
                 
                 redaction_prompt = (
                     "You are a strict data privacy redaction agent. Your previous attempt to anonymize a problem failed the security audit.\n\n"
-                    f"PREVIOUS SOLVER_SPEC:\n{solver_spec}\nPREVIOUS FALSIFICATION_SPEC:\n{falsification_spec}\n"
-                    f"AUDITOR FEEDBACK:\n- Solver Audit: {s_notes}\n- Falsify Audit: {v_notes}\n\n"
-                    "INSTRUCTION: Rewrite BOTH specifications to completely eliminate the identified leaks. Format STRICTLY as:\n===SOLVER_SPEC===\n<rewritten prompt>\n===FALSIFICATION_SPEC===\n<rewritten proposition>"
+                    f"PREVIOUS SOLVER_SPEC:\n{solver_spec}\n"
+                    f"AUDITOR FEEDBACK (Solver): {s_notes}\n"
                 )
+                if state.enable_verifier:
+                    redaction_prompt += f"PREVIOUS FALSIFICATION_SPEC:\n{falsification_spec}\nAUDITOR FEEDBACK (Falsify): {v_notes}\n"
+                    redaction_prompt += "\nINSTRUCTION: Rewrite BOTH specifications to eliminate leaks. Format STRICTLY as:\n===SOLVER_SPEC===\n<rewritten prompt>\n===FALSIFICATION_SPEC===\n<rewritten proposition>"
+                else:
+                    redaction_prompt += "\nINSTRUCTION: Rewrite the specification to eliminate leaks. Format STRICTLY as:\n===SOLVER_SPEC===\n<rewritten prompt>"
                 
                 redacted_raw = ""
                 async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(triage_sys, conversation_history, redaction_prompt)):
@@ -399,41 +412,54 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 step += 1
 
                 rev_solver, rev_falsify = extract_specs(redacted_raw)
-                if rev_solver and rev_falsify: solver_spec, falsification_spec = rev_solver, rev_falsify
-                else: break # Failsafe: abort auto-redaction if format breaks
+                if rev_solver: 
+                    solver_spec = rev_solver
+                    if state.enable_verifier and rev_falsify: falsification_spec = rev_falsify
+                else: break
 
                 yield format_sse("\n> Re-Auditing Redacted Prompts...\n")
                 s_cert, s_notes, s_raw = await evaluate_audit_certainty(solver_spec, turn_id, step)
-                v_cert, v_notes, v_raw = await evaluate_audit_certainty(falsification_spec, turn_id, step + 1)
-                step += 2
+                step += 1
+                if state.enable_verifier:
+                    v_cert, v_notes, v_raw = await evaluate_audit_certainty(falsification_spec, turn_id, step)
+                    step += 1
+                needs_redact = (s_cert != AuditCertainty.HIGH_CERTAINTY_CLEAN) or (state.enable_verifier and v_cert != AuditCertainty.HIGH_CERTAINTY_CLEAN)
 
             # DASHBOARD GATEWAY (MANUAL FEEDBACK SUPPORT)
             rec_solver = QueueRecord(id=str(uuid.uuid4()), turn_id=turn_id, round_idx=correction_round, created_at=time.time(), target_provider=f"Provider 1 ({PROVIDER1_MODEL_NAME})", spec_type=f"solver_r{correction_round}", prompt_text=solver_spec, certainty=s_cert, audit_notes=s_notes, evaluator_raw_response=s_raw)
-            rec_verifier = QueueRecord(id=str(uuid.uuid4()), turn_id=turn_id, round_idx=correction_round, created_at=time.time(), target_provider=f"Provider 2 ({PROVIDER2_MODEL_NAME})" if PROVIDER2_ENABLED else f"Local Keystone ({LOCAL_MODEL_NAME})", spec_type=f"verifier_r{correction_round}", prompt_text=falsification_spec, certainty=v_cert, audit_notes=v_notes, evaluator_raw_response=v_raw)
-
+            
             yield format_sse("> Awaiting Dashboard Gateway Approval...\n")
-            if PROVIDER2_ENABLED:
-                res_s, res_v = await asyncio.gather(queue_and_await_approval(rec_solver, step), queue_and_await_approval(rec_verifier, step + 1))
-                action_s, text_s, feed_s = res_s
-                action_v, text_v, feed_v = res_v
-                step += 2
+            if state.enable_verifier:
+                rec_verifier = QueueRecord(id=str(uuid.uuid4()), turn_id=turn_id, round_idx=correction_round, created_at=time.time(), target_provider=f"Provider 2 ({PROVIDER2_MODEL_NAME})" if PROVIDER2_ENABLED else f"Local Keystone ({LOCAL_MODEL_NAME})", spec_type=f"verifier_r{correction_round}", prompt_text=falsification_spec, certainty=v_cert, audit_notes=v_notes, evaluator_raw_response=v_raw)
+                if PROVIDER2_ENABLED:
+                    res_s, res_v = await asyncio.gather(queue_and_await_approval(rec_solver, step), queue_and_await_approval(rec_verifier, step + 1))
+                    action_s, text_s, feed_s = res_s
+                    action_v, text_v, feed_v = res_v
+                    step += 2
+                    if action_s == "reject" or action_v == "reject": raise HTTPException(status_code=403, detail="Egress specs rejected.")
+                else:
+                    action_s, text_s, feed_s = await queue_and_await_approval(rec_solver, step)
+                    action_v, text_v, feed_v = "approve", falsification_spec, ""
+                    step += 1
+                    if action_s == "reject": raise HTTPException(status_code=403, detail="Solver spec rejected.")
             else:
                 action_s, text_s, feed_s = await queue_and_await_approval(rec_solver, step)
-                action_v, text_v, feed_v = "approve", falsification_spec, ""
+                action_v, text_v, feed_v = "approve", "N/A", ""
                 step += 1
+                if action_s == "reject": raise HTTPException(status_code=403, detail="Solver spec rejected.")
 
-            if action_s == "reject" or action_v == "reject": raise HTTPException(status_code=403, detail="Egress specs rejected by user.")
-            
             # MANUAL FEEDBACK LOOP
             if action_s == "feedback" or action_v == "feedback":
                 yield format_sse("\n> 🔄 User submitted manual rewrite feedback. Regenerating specs...\n")
                 active_feed = feed_s if action_s == "feedback" else feed_v
                 manual_prompt = (
                     "You are a strict data privacy redaction agent. The user requested manual revisions to your specifications.\n\n"
-                    f"PREVIOUS SOLVER_SPEC:\n{solver_spec}\nPREVIOUS FALSIFICATION_SPEC:\n{falsification_spec}\n"
-                    f"USER FEEDBACK:\n{active_feed}\n\n"
-                    "INSTRUCTION: Rewrite BOTH specifications adhering perfectly to the feedback. Format STRICTLY as:\n===SOLVER_SPEC===\n<rewritten prompt>\n===FALSIFICATION_SPEC===\n<rewritten proposition>"
+                    f"PREVIOUS SOLVER_SPEC:\n{solver_spec}\n"
                 )
+                if state.enable_verifier: manual_prompt += f"PREVIOUS FALSIFICATION_SPEC:\n{falsification_spec}\n"
+                manual_prompt += f"USER FEEDBACK:\n{active_feed}\n\nINSTRUCTION: Rewrite perfectly adhering to feedback. Format STRICTLY as:\n===SOLVER_SPEC===\n<rewritten prompt>\n"
+                if state.enable_verifier: manual_prompt += "===FALSIFICATION_SPEC===\n<rewritten proposition>"
+
                 redacted_raw = ""
                 async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(triage_sys, conversation_history, manual_prompt)):
                     if c_reasoning: yield format_sse(c_reasoning)
@@ -441,11 +467,14 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 step += 1
                 
                 rev_solver, rev_falsify = extract_specs(redacted_raw)
-                if rev_solver and rev_falsify: solver_spec, falsification_spec = rev_solver, rev_falsify
+                if rev_solver: 
+                    solver_spec = rev_solver
+                    if state.enable_verifier and rev_falsify: falsification_spec = rev_falsify
                 else: solver_spec = re.sub(r"<think>.*?(</think>|$)", "", redacted_raw, flags=re.DOTALL|re.IGNORECASE).strip()
-                continue # Loops back to the start of the while loop to re-audit
+                continue
 
-            solver_spec, falsification_spec = text_s, text_v
+            solver_spec = text_s
+            if state.enable_verifier: falsification_spec = text_v
             spec_approved = True
 
         # --- EXECUTION STAGE ---
@@ -462,25 +491,29 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             if finish_data: await db_record_subrequest(solver_step_id, turn_id, step, finish_data[0], f"EXTERNAL_SOLVER_R{correction_round}", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", solver_spec, final_solver_res, s_cert.value, "Derivation completed", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
         step += 1
 
-        yield format_sse(f"\n\n> Waiting for Referee Verdict...\n")
-        
-        async def run_verifier(step_idx: int):
-            actual_referee_prompt = f"Evaluate the derived solution against the constraints:\n\nCONSTRAINTS:\n{falsification_spec}\n\nDERIVED SOLUTION:\n{final_solver_res}\n\nIf the solution contains an admissible flaw, output 'VERDICT: FALSIFIED' and explain.\nIf strictly sound, output 'VERDICT: SOUND'."
-            v_api, v_key, v_mod = (PROVIDER2_API_BASE, PROVIDER2_API_KEY, PROVIDER2_MODEL_NAME) if PROVIDER2_ENABLED else (LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME)
-            await db_record_subrequest(str(uuid.uuid4()), turn_id, step_idx, 0.0, f"VERIFIER_R{correction_round}", PROVIDER2_ENABLED, v_mod, actual_referee_prompt, "[Streaming...]", v_cert.value, "Referee check started", "IN_PROGRESS")
-            ans, lat, usg = await call_llm(v_api, v_key, v_mod, [{"role": "user", "content": actual_referee_prompt}], max_tokens=None)
-            await db_record_subrequest(str(uuid.uuid4()), turn_id, step_idx, lat, f"VERIFIER_R{correction_round}", PROVIDER2_ENABLED, v_mod, actual_referee_prompt, ans, v_cert.value, "Referee check completed", "COMPLETED", usg.get("prompt_tokens",0), usg.get("completion_tokens",0), usg.get("total_tokens",0))
-            return ans
+        if state.enable_verifier:
+            yield format_sse(f"\n\n> Waiting for Referee Verdict...\n")
+            
+            async def run_verifier(step_idx: int):
+                actual_referee_prompt = f"Evaluate the derived solution against the constraints:\n\nCONSTRAINTS:\n{falsification_spec}\n\nDERIVED SOLUTION:\n{final_solver_res}\n\nIf the solution contains an admissible flaw, output 'VERDICT: FALSIFIED' and explain.\nIf strictly sound, output 'VERDICT: SOUND'."
+                v_api, v_key, v_mod = (PROVIDER2_API_BASE, PROVIDER2_API_KEY, PROVIDER2_MODEL_NAME) if PROVIDER2_ENABLED else (LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME)
+                await db_record_subrequest(str(uuid.uuid4()), turn_id, step_idx, 0.0, f"VERIFIER_R{correction_round}", PROVIDER2_ENABLED, v_mod, actual_referee_prompt, "[Streaming...]", v_cert.value, "Referee check started", "IN_PROGRESS")
+                ans, lat, usg = await call_llm(v_api, v_key, v_mod, [{"role": "user", "content": actual_referee_prompt}], max_tokens=None)
+                await db_record_subrequest(str(uuid.uuid4()), turn_id, step_idx, lat, f"VERIFIER_R{correction_round}", PROVIDER2_ENABLED, v_mod, actual_referee_prompt, ans, v_cert.value, "Referee check completed", "COMPLETED", usg.get("prompt_tokens",0), usg.get("completion_tokens",0), usg.get("total_tokens",0))
+                return ans
 
-        verifier_task = asyncio.create_task(run_verifier(step))
-        final_verifier_res = await verifier_task
-        verifier_task = None
-        step += 1
+            verifier_task = asyncio.create_task(run_verifier(step))
+            final_verifier_res = await verifier_task
+            verifier_task = None
+            step += 1
 
-        yield format_sse(f"\n--- REFEREE VERDICT ---\n{final_verifier_res}\n")
+            yield format_sse(f"\n--- REFEREE VERDICT ---\n{final_verifier_res}\n")
 
-        if "VERDICT: FALSIFIED" in final_verifier_res:
-            yield format_sse("\n⚠️ Boundary Warning: Derivation Falsified by Referee. External loop ends.\n")
+            if "VERDICT: FALSIFIED" in final_verifier_res:
+                yield format_sse("\n⚠️ Boundary Warning: Derivation Falsified by Referee. External loop ends.\n")
+        else:
+            final_verifier_res = "Referee verification is disabled by user policy."
+            yield format_sse(f"\n\n--- REFEREE VERDICT ---\n{final_verifier_res}\n")
 
         yield format_sse("\n=== 3. FINAL INTEGRATION ===\nSynthesizing verified solution...\n")
         assemble_sys = "You are the local integration architect. Synthesize the user's request, external derivation, and referee report into a cohesive, verified final answer. Acknowledge boundary limitations if refuted."
@@ -577,7 +610,7 @@ async def get_dashboard():
 
 @app.get("/api/state")
 async def get_api_state():
-    async with state_lock: return {"policy": state.policy.value, "force_delegate": state.force_delegate, "auto_redact": state.auto_redact, "queue": [r.model_dump() for r in state.queue.values()]}
+    async with state_lock: return {"policy": state.policy.value, "force_delegate": state.force_delegate, "auto_redact": state.auto_redact, "enable_verifier": state.enable_verifier, "queue": [r.model_dump() for r in state.queue.values()]}
 
 @app.get("/api/logs")
 async def get_paginated_logs(page: int = 1, page_size: int = 10):
@@ -621,6 +654,7 @@ async def update_routing(payload: Dict[str, Any]):
     async with state_lock:
         if "force_delegate" in payload: state.force_delegate = payload["force_delegate"]
         if "auto_redact" in payload: state.auto_redact = payload["auto_redact"]
+        if "enable_verifier" in payload: state.enable_verifier = payload["enable_verifier"]
     return {"status": "ok"}
 
 @app.post("/api/edit/{req_id}")

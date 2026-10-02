@@ -88,15 +88,22 @@
                 <div>
                     <h2>Routing Strategy</h2>
                     <div class="policy-group">
-                        <button class="policy-btn" id="btn-route-auto" onclick="setRoutingState({force_delegate: false})">Auto-Adaptive (Local First)</button>
-                        <button class="policy-btn" id="btn-route-force" onclick="setRoutingState({force_delegate: true})">Force Egress Delegation</button>
+                        <button class="policy-btn" id="btn-route-auto" onclick="setRoutingState({force_delegate: false})">Auto-Adaptive</button>
+                        <button class="policy-btn" id="btn-route-force" onclick="setRoutingState({force_delegate: true})">Force Egress</button>
+                    </div>
+                </div>
+                <div>
+                    <h2>Referee Verification</h2>
+                    <div class="policy-group">
+                        <button class="policy-btn" id="btn-verifier-on" onclick="setRoutingState({enable_verifier: true})">Enabled</button>
+                        <button class="policy-btn" id="btn-verifier-off" onclick="setRoutingState({enable_verifier: false})">Disabled</button>
                     </div>
                 </div>
                 <div>
                     <h2>Anonymization Loop</h2>
                     <div class="policy-group">
-                        <button class="policy-btn" id="btn-redact-auto" onclick="setRoutingState({auto_redact: true})">Auto Actor-Critic</button>
-                        <button class="policy-btn" id="btn-redact-manual" onclick="setRoutingState({auto_redact: false})">Manual Review Only</button>
+                        <button class="policy-btn" id="btn-redact-auto" onclick="setRoutingState({auto_redact: true})">Auto Critic</button>
+                        <button class="policy-btn" id="btn-redact-manual" onclick="setRoutingState({auto_redact: false})">Manual Only</button>
                     </div>
                 </div>
                 <div>
@@ -237,6 +244,9 @@
 
                 if (data.auto_redact) { document.getElementById('btn-redact-auto').classList.add('active'); document.getElementById('btn-redact-manual').classList.remove('active'); } 
                 else { document.getElementById('btn-redact-manual').classList.add('active'); document.getElementById('btn-redact-auto').classList.remove('active'); }
+
+                if (data.enable_verifier) { document.getElementById('btn-verifier-on').classList.add('active'); document.getElementById('btn-verifier-off').classList.remove('active'); } 
+                else { document.getElementById('btn-verifier-off').classList.add('active'); document.getElementById('btn-verifier-on').classList.remove('active'); }
 
                 document.getElementById('queue-count').innerText = data.queue.length;
                 const qContainer = document.getElementById('queue-container');
