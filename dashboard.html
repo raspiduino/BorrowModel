@@ -39,11 +39,12 @@
         
         pre { background: #0f172a; padding: 10px; border-radius: 6px; overflow-x: auto; max-height: 180px; white-space: pre-wrap; font-size: 13px; border: 1px solid #334155; margin: 0; }
         .evaluator-box { background: #172554; border-left: 3px solid #38bdf8; padding: 10px; border-radius: 4px; font-size: 13px; color: #e0f2fe; }
-        .btn-action { color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 6px; }
+        .btn-action { color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 6px; box-sizing: border-box; }
         .btn-approve { background: #059669; } .btn-approve:hover { background: #047857; }
         .btn-reject { background: #dc2626; margin-bottom: 0;} .btn-reject:hover { background: #b91c1c; }
+        .btn-feedback { background: #ca8a04; } .btn-feedback:hover { background: #a16207; }
         .btn-edit { background: #0284c7; width: auto; font-size:11px; padding: 4px 8px; margin-top:8px;} .btn-edit:hover{ background: #0369a1; }
-        .btn-copy { position:absolute; right:4px; top:4px; font-size:10px; padding:2px 6px; background:#334155; color:#fff; border:1px solid #475569; border-radius:4px; cursor:pointer; }
+        .btn-copy { position:absolute; right:4px; top:4px; font-size:10px; padding:2px 6px; background:#334155; color:#fff; border:1px solid #475569; border-radius:4px; cursor:pointer; z-index: 10; }
         .sub-meta { color: #94a3b8; font-size: 11px; margin-top: 4px; }
         
         .turn-card { background: #111827; border: 1px solid #374151; border-radius: 8px; margin-bottom: 16px; overflow: hidden; }
@@ -67,7 +68,7 @@
         .pager-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         select.page-select { background: #334155; color: #fff; border: 1px solid #475569; padding: 6px 10px; border-radius: 4px; }
         
-        textarea.edit-area { width:100%; height:150px; background:#0f172a; color:#f8fafc; border:1px solid #38bdf8; padding:8px; border-radius:4px; font-family:monospace; font-size:12px; resize:vertical; }
+        textarea.edit-area { width:100%; box-sizing:border-box; background:#0f172a; color:#f8fafc; border:1px solid #38bdf8; padding:8px; border-radius:4px; font-family:monospace; font-size:12px; resize:vertical; }
     </style>
 </head>
 <body>
@@ -87,8 +88,15 @@
                 <div>
                     <h2>Routing Strategy</h2>
                     <div class="policy-group">
-                        <button class="policy-btn" id="btn-route-auto" onclick="setRouting(false)">Auto-Adaptive (Local First)</button>
-                        <button class="policy-btn" id="btn-route-force" onclick="setRouting(true)">Force Egress Delegation</button>
+                        <button class="policy-btn" id="btn-route-auto" onclick="setRoutingState({force_delegate: false})">Auto-Adaptive (Local First)</button>
+                        <button class="policy-btn" id="btn-route-force" onclick="setRoutingState({force_delegate: true})">Force Egress Delegation</button>
+                    </div>
+                </div>
+                <div>
+                    <h2>Anonymization Loop</h2>
+                    <div class="policy-group">
+                        <button class="policy-btn" id="btn-redact-auto" onclick="setRoutingState({auto_redact: true})">Auto Actor-Critic</button>
+                        <button class="policy-btn" id="btn-redact-manual" onclick="setRoutingState({auto_redact: false})">Manual Review Only</button>
                     </div>
                 </div>
                 <div>
@@ -136,7 +144,7 @@
                 <div class="stat-box"><div style="color: #94a3b8; font-size: 14px;">TOTAL TOKENS BURNED</div><div class="stat-num" id="stat-total">0</div></div>
             </div>
 
-            <div class="card">
+            <div class="card" onmouseenter="pauseLogs=true" onmouseleave="pauseLogs=false">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <h2>Turn-Level Token Ledger</h2>
                     <div>
@@ -196,7 +204,7 @@
             const preEl = document.getElementById(`q-pre-${id}`);
             const td = document.getElementById(`prompt-td-${id}`);
             td.innerHTML = `
-                <textarea id="edit-area-${id}" class="edit-area">${escapeHtml(preEl.innerText)}</textarea>
+                <textarea id="edit-area-${id}" class="edit-area" style="height:150px;">${escapeHtml(preEl.innerText)}</textarea>
                 <div style="margin-top:8px; display:flex; gap:8px;">
                     <button class="btn-action btn-approve" onclick="saveEdit('${id}')" style="margin-bottom:0; width:auto;">Save Edit</button>
                     <button class="btn-action btn-reject" onclick="cancelEdit('${id}')" style="margin-bottom:0; width:auto;">Cancel</button>
@@ -211,10 +219,7 @@
             fetchQueueState();
         }
 
-        function cancelEdit(id) {
-            activeEdits.delete(id);
-            fetchQueueState();
-        }
+        function cancelEdit(id) { activeEdits.delete(id); fetchQueueState(); }
 
         async function fetchQueueState() {
             if (currentTab !== 'traces' || pauseQueue || activeEdits.size > 0) return;
@@ -230,14 +235,19 @@
                 if (data.force_delegate) { document.getElementById('btn-route-force').classList.add('active'); document.getElementById('btn-route-auto').classList.remove('active'); } 
                 else { document.getElementById('btn-route-auto').classList.add('active'); document.getElementById('btn-route-force').classList.remove('active'); }
 
+                if (data.auto_redact) { document.getElementById('btn-redact-auto').classList.add('active'); document.getElementById('btn-redact-manual').classList.remove('active'); } 
+                else { document.getElementById('btn-redact-manual').classList.add('active'); document.getElementById('btn-redact-auto').classList.remove('active'); }
+
                 document.getElementById('queue-count').innerText = data.queue.length;
                 const qContainer = document.getElementById('queue-container');
                 if (data.queue.length === 0) {
                     qContainer.innerHTML = "<p style='color:#94a3b8;'>No pending requests awaiting approval.</p>";
                 } else {
-                    let html = `<table><tr><th style="width:14%">Target & Spec</th><th style="width:38%">Candidate Prompt to Wire</th><th style="width:36%">Evaluator Diagnosis (Audit Model)</th><th style="width:12%">Action</th></tr>`;
+                    let html = `<table><tr><th style="width:12%">Target & Spec</th><th style="width:40%">Candidate Prompt to Wire</th><th style="width:36%">Auditor Feedback & Redaction</th><th style="width:12%">Action</th></tr>`;
                     data.queue.forEach(item => {
                         let badgeClass = item.certainty === 'high_certainty_clean' ? 'badge-clean' : (item.certainty === 'uncertain' ? 'badge-uncertain' : 'badge-leak');
+                        let placeholderText = item.certainty === 'high_certainty_clean' ? "Auditor found no leaks. Add manual feedback here to force a rewrite..." : "Auditor flagged issues. Edit notes before pushing to rewrite...";
+                        
                         html += `<tr>
                             <td><strong>${item.target_provider}</strong><br><span class="badge ${badgeClass}" style="margin-top:4px;">${item.certainty}</span><div class="sub-meta">Spec: ${item.spec_type.toUpperCase()}<br>Round: ${item.round_idx || 1}</div></td>
                             <td id="prompt-td-${item.id}">
@@ -245,10 +255,20 @@
                                     <button class="btn-copy" onclick="copyText(this, 'q-pre-${item.id}')">📋 Copy</button>
                                     <pre id="q-pre-${item.id}">${escapeHtml(item.prompt_text)}</pre>
                                 </div>
-                                <button class="btn-action btn-edit" onclick="editRequest('${item.id}')">✏️ Edit Payload Before Sending</button>
+                                <button class="btn-action btn-edit" onclick="editRequest('${item.id}')">✏️ Quick-Edit Payload Before Sending</button>
                             </td>
-                            <td><div class="evaluator-box"><strong>Assessment:</strong> ${escapeHtml(item.audit_notes)}${item.evaluator_raw_response ? `<details style="margin-top:8px;"><summary style="cursor:pointer;">Raw Evaluator CoT</summary><pre style="margin-top:6px; max-height:100px;">${escapeHtml(item.evaluator_raw_response)}</pre></details>` : ''}</div></td>
-                            <td><button class="btn-action btn-approve" onclick="resolve('${item.id}', 'approve')">Approve</button><button class="btn-action btn-reject" onclick="resolve('${item.id}', 'reject')">Reject</button></td>
+                            <td>
+                                <div class="evaluator-box">
+                                    <div style="margin-bottom:6px;"><strong>Auditor Assessment:</strong></div>
+                                    <textarea id="feedback-txt-${item.id}" class="edit-area" style="height: 60px;" placeholder="${placeholderText}">${item.audit_notes}</textarea>
+                                    ${item.evaluator_raw_response ? `<details style="margin-top:8px;"><summary style="cursor:pointer;">Raw Evaluator CoT</summary><pre style="margin-top:6px; max-height:100px;">${escapeHtml(item.evaluator_raw_response)}</pre></details>` : ''}
+                                </div>
+                            </td>
+                            <td>
+                                <button class="btn-action btn-approve" onclick="resolve('${item.id}', 'approve')">Approve</button>
+                                <button class="btn-action btn-feedback" onclick="resolve('${item.id}', 'feedback')">🔄 Send Feedback & Rewrite</button>
+                                <button class="btn-action btn-reject" onclick="resolve('${item.id}', 'reject')">Reject</button>
+                            </td>
                         </tr>`;
                     });
                     html += "</table>";
@@ -334,7 +354,7 @@
         }
 
         async function fetchTokens() {
-            if (currentTab !== 'tokens') return;
+            if (currentTab !== 'tokens' || pauseLogs) return;
             try {
                 const res = await fetch(`/api/tokens?page=${tokenPage}&page_size=${tokenPageSize}`);
                 const data = await res.json();
@@ -387,11 +407,23 @@
         }
 
         async function setPolicy(p) { await fetch('/api/policy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: p }) }); fetchQueueState(); }
-        async function setRouting(force) { await fetch('/api/routing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force_delegate: force }) }); fetchQueueState(); }
-        async function resolve(id, action) { await fetch(`/api/resolve/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action }) }); fetchQueueState(); fetchLogs(); }
+        async function setRoutingState(payload) { await fetch('/api/routing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); fetchQueueState(); }
+        
+        async function resolve(id, action) {
+            let payload = { action: action };
+            const editEl = document.getElementById(`edit-area-${id}`);
+            if (editEl) payload.prompt_text = editEl.value;
+            
+            const feedbackEl = document.getElementById(`feedback-txt-${id}`);
+            if (feedbackEl) payload.feedback_text = feedbackEl.value;
+
+            await fetch(`/api/resolve/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            activeEdits.delete(id);
+            fetchQueueState(); fetchLogs();
+        }
 
         setInterval(() => { if (!pauseQueue) fetchQueueState(); }, 1500);
-        setInterval(() => { if (currentTab === 'traces' && !pauseLogs) fetchLogs(); if (currentTab === 'tokens') fetchTokens(); }, 5000);
+        setInterval(() => { if (currentTab === 'traces' && !pauseLogs) fetchLogs(); if (currentTab === 'tokens' && !pauseLogs) fetchTokens(); }, 5000);
         fetchQueueState(); fetchLogs();
     </script>
 </body>
