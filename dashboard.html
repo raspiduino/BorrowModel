@@ -10,14 +10,12 @@
         h1, h2 { color: #38bdf8; margin-top: 0; }
         .card { background: #1e293b; border-radius: 8px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; }
         
-        /* Tabs */
         .tabs { display: flex; gap: 8px; border-bottom: 2px solid #334155; margin-bottom: 20px; }
         .tab-btn { background: transparent; color: #94a3b8; border: none; padding: 12px 24px; cursor: pointer; font-size: 16px; font-weight: bold; border-bottom: 2px solid transparent; margin-bottom: -2px; }
         .tab-btn.active { color: #38bdf8; border-bottom: 2px solid #38bdf8; }
         .tab-content { display: none; }
         .tab-content.active { display: block; }
 
-        /* Stats Grid */
         .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
         .stat-box { background: #111827; border: 1px solid #374151; border-radius: 8px; padding: 20px; text-align: center; }
         .stat-num { font-size: 32px; font-weight: bold; color: #38bdf8; margin-top: 8px; }
@@ -41,9 +39,11 @@
         
         pre { background: #0f172a; padding: 10px; border-radius: 6px; overflow-x: auto; max-height: 180px; white-space: pre-wrap; font-size: 13px; border: 1px solid #334155; margin: 0; }
         .evaluator-box { background: #172554; border-left: 3px solid #38bdf8; padding: 10px; border-radius: 4px; font-size: 13px; color: #e0f2fe; }
-        .btn-approve, .btn-reject { color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 6px; }
+        .btn-action { color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 6px; }
         .btn-approve { background: #059669; } .btn-approve:hover { background: #047857; }
-        .btn-reject { background: #dc2626; margin-bottom: 0; } .btn-reject:hover { background: #b91c1c; }
+        .btn-reject { background: #dc2626; margin-bottom: 0;} .btn-reject:hover { background: #b91c1c; }
+        .btn-edit { background: #0284c7; width: auto; font-size:11px; padding: 4px 8px; margin-top:8px;} .btn-edit:hover{ background: #0369a1; }
+        .btn-copy { position:absolute; right:4px; top:4px; font-size:10px; padding:2px 6px; background:#334155; color:#fff; border:1px solid #475569; border-radius:4px; cursor:pointer; }
         .sub-meta { color: #94a3b8; font-size: 11px; margin-top: 4px; }
         
         .turn-card { background: #111827; border: 1px solid #374151; border-radius: 8px; margin-bottom: 16px; overflow: hidden; }
@@ -66,6 +66,8 @@
         .pager-btn { background: #334155; color: #fff; border: 1px solid #475569; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
         .pager-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         select.page-select { background: #334155; color: #fff; border: 1px solid #475569; padding: 6px 10px; border-radius: 4px; }
+        
+        textarea.edit-area { width:100%; height:150px; background:#0f172a; color:#f8fafc; border:1px solid #38bdf8; padding:8px; border-radius:4px; font-family:monospace; font-size:12px; resize:vertical; }
     </style>
 </head>
 <body>
@@ -80,7 +82,6 @@
             <button class="tab-btn" onclick="switchTab('tokens')">Token Statistics</button>
         </div>
 
-        <!-- TAB 1: EXECUTION TRACES -->
         <div id="tab-traces" class="tab-content active">
             <div class="card" style="display: flex; gap: 40px; flex-wrap: wrap;">
                 <div>
@@ -100,12 +101,12 @@
                 </div>
             </div>
 
-            <div class="card">
+            <div class="card" onmouseenter="pauseQueue=true" onmouseleave="pauseQueue=false">
                 <h2>Pending Outgoing Approval Queue (<span id="queue-count">0</span>)</h2>
                 <div id="queue-container">Loading queue...</div>
             </div>
 
-            <div class="card">
+            <div class="card" onmouseenter="pauseLogs=true" onmouseleave="pauseLogs=false">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <h2>Message Turn Traces (Live Updates)</h2>
                     <div>
@@ -128,21 +129,11 @@
             </div>
         </div>
 
-        <!-- TAB 2: TOKEN STATISTICS -->
         <div id="tab-tokens" class="tab-content">
             <div class="stats-grid">
-                <div class="stat-box">
-                    <div style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Total Prompt Tokens</div>
-                    <div class="stat-num" id="stat-prompt">0</div>
-                </div>
-                <div class="stat-box">
-                    <div style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Total Completion Tokens</div>
-                    <div class="stat-num" id="stat-comp">0</div>
-                </div>
-                <div class="stat-box">
-                    <div style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Total Tokens Burned</div>
-                    <div class="stat-num" id="stat-total">0</div>
-                </div>
+                <div class="stat-box"><div style="color: #94a3b8; font-size: 14px;">TOTAL PROMPT TOKENS</div><div class="stat-num" id="stat-prompt">0</div></div>
+                <div class="stat-box"><div style="color: #94a3b8; font-size: 14px;">TOTAL COMPLETION TOKENS</div><div class="stat-num" id="stat-comp">0</div></div>
+                <div class="stat-box"><div style="color: #94a3b8; font-size: 14px;">TOTAL TOKENS BURNED</div><div class="stat-num" id="stat-total">0</div></div>
             </div>
 
             <div class="card">
@@ -158,14 +149,7 @@
                     </div>
                 </div>
                 <table id="token-table">
-                    <tr>
-                        <th style="width: 25%;">Turn ID</th>
-                        <th style="width: 15%;">Time</th>
-                        <th style="width: 15%;">Prompt</th>
-                        <th style="width: 15%;">Completion</th>
-                        <th style="width: 15%;">Total</th>
-                        <th style="width: 15%;">Breakdown</th>
-                    </tr>
+                    <tr><th style="width: 25%;">Turn ID</th><th style="width: 15%;">Time</th><th style="width: 15%;">Prompt</th><th style="width: 15%;">Completion</th><th style="width: 15%;">Total</th><th style="width: 15%;">Breakdown</th></tr>
                     <tbody id="token-table-body"></tbody>
                 </table>
                 <div class="pager-bar">
@@ -185,6 +169,8 @@
         let tokenPage = 1, tokenPageSize = 25;
         let openTurns = new Set();
         let openDetails = new Set();
+        let activeEdits = new Set();
+        let pauseLogs = false, pauseQueue = false;
 
         function switchTab(tabName) {
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
@@ -198,8 +184,40 @@
 
         function escapeHtml(str) { return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
+        function copyText(btnElement, targetId) {
+            const text = document.getElementById(targetId).innerText;
+            navigator.clipboard.writeText(text);
+            btnElement.innerText = "Copied!";
+            setTimeout(() => { btnElement.innerText = "📋 Copy"; }, 2000);
+        }
+
+        function editRequest(id) {
+            activeEdits.add(id);
+            const preEl = document.getElementById(`q-pre-${id}`);
+            const td = document.getElementById(`prompt-td-${id}`);
+            td.innerHTML = `
+                <textarea id="edit-area-${id}" class="edit-area">${escapeHtml(preEl.innerText)}</textarea>
+                <div style="margin-top:8px; display:flex; gap:8px;">
+                    <button class="btn-action btn-approve" onclick="saveEdit('${id}')" style="margin-bottom:0; width:auto;">Save Edit</button>
+                    <button class="btn-action btn-reject" onclick="cancelEdit('${id}')" style="margin-bottom:0; width:auto;">Cancel</button>
+                </div>
+            `;
+        }
+
+        async function saveEdit(id) {
+            const newText = document.getElementById(`edit-area-${id}`).value;
+            await fetch(`/api/edit/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt_text: newText }) });
+            activeEdits.delete(id);
+            fetchQueueState();
+        }
+
+        function cancelEdit(id) {
+            activeEdits.delete(id);
+            fetchQueueState();
+        }
+
         async function fetchQueueState() {
-            if (currentTab !== 'traces') return;
+            if (currentTab !== 'traces' || pauseQueue || activeEdits.size > 0) return;
             try {
                 const res = await fetch('/api/state');
                 const data = await res.json();
@@ -209,13 +227,8 @@
                 if (data.policy === 'confidence') document.getElementById('btn-confidence').classList.add('active');
                 if (data.policy === 'manual') document.getElementById('btn-manual').classList.add('active');
 
-                if (data.force_delegate) {
-                    document.getElementById('btn-route-force').classList.add('active');
-                    document.getElementById('btn-route-auto').classList.remove('active');
-                } else {
-                    document.getElementById('btn-route-auto').classList.add('active');
-                    document.getElementById('btn-route-force').classList.remove('active');
-                }
+                if (data.force_delegate) { document.getElementById('btn-route-force').classList.add('active'); document.getElementById('btn-route-auto').classList.remove('active'); } 
+                else { document.getElementById('btn-route-auto').classList.add('active'); document.getElementById('btn-route-force').classList.remove('active'); }
 
                 document.getElementById('queue-count').innerText = data.queue.length;
                 const qContainer = document.getElementById('queue-container');
@@ -227,9 +240,15 @@
                         let badgeClass = item.certainty === 'high_certainty_clean' ? 'badge-clean' : (item.certainty === 'uncertain' ? 'badge-uncertain' : 'badge-leak');
                         html += `<tr>
                             <td><strong>${item.target_provider}</strong><br><span class="badge ${badgeClass}" style="margin-top:4px;">${item.certainty}</span><div class="sub-meta">Spec: ${item.spec_type.toUpperCase()}<br>Round: ${item.round_idx || 1}</div></td>
-                            <td><pre>${escapeHtml(item.prompt_text)}</pre></td>
-                            <td><div class="evaluator-box"><strong>Assessment:</strong> ${escapeHtml(item.audit_notes)}${item.evaluator_raw_response ? `<details style="margin-top:8px;"><summary>Raw Evaluator CoT</summary><pre style="margin-top:6px; max-height:100px;">${escapeHtml(item.evaluator_raw_response)}</pre></details>` : ''}</div></td>
-                            <td><button class="btn-approve" onclick="resolve('${item.id}', 'approve')">Approve</button><button class="btn-reject" onclick="resolve('${item.id}', 'reject')">Reject</button></td>
+                            <td id="prompt-td-${item.id}">
+                                <div style="position:relative;">
+                                    <button class="btn-copy" onclick="copyText(this, 'q-pre-${item.id}')">📋 Copy</button>
+                                    <pre id="q-pre-${item.id}">${escapeHtml(item.prompt_text)}</pre>
+                                </div>
+                                <button class="btn-action btn-edit" onclick="editRequest('${item.id}')">✏️ Edit Payload Before Sending</button>
+                            </td>
+                            <td><div class="evaluator-box"><strong>Assessment:</strong> ${escapeHtml(item.audit_notes)}${item.evaluator_raw_response ? `<details style="margin-top:8px;"><summary style="cursor:pointer;">Raw Evaluator CoT</summary><pre style="margin-top:6px; max-height:100px;">${escapeHtml(item.evaluator_raw_response)}</pre></details>` : ''}</div></td>
+                            <td><button class="btn-action btn-approve" onclick="resolve('${item.id}', 'approve')">Approve</button><button class="btn-action btn-reject" onclick="resolve('${item.id}', 'reject')">Reject</button></td>
                         </tr>`;
                     });
                     html += "</table>";
@@ -239,7 +258,7 @@
         }
 
         async function fetchLogs() {
-            if (currentTab !== 'traces') return;
+            if (currentTab !== 'traces' || pauseLogs) return;
             try {
                 const res = await fetch(`/api/logs?page=${tracePage}&page_size=${tracePageSize}`);
                 const resData = await res.json();
@@ -254,7 +273,7 @@
                 if (resData.data.length === 0) { lContainer.innerHTML = "<p style='color:#94a3b8;'>No message turns logged yet.</p>"; return; }
 
                 let currentHash = resData.data.map(t => t.turn_id + t.status + t.metrics.total_subrequests + t.metrics.total_tokens).join('|');
-                if (lContainer.getAttribute('data-hash') === currentHash) return; // Perfect virtual-dom diff skip
+                if (lContainer.getAttribute('data-hash') === currentHash) return;
 
                 let htmlStrAll = "";
                 resData.data.forEach((turn) => {
@@ -297,9 +316,9 @@
                                 <table>
                                     <tr><th style="width:50%;">Inbound Prompt Payload</th><th style="width:50%;">Response / Diagnosis</th></tr>
                                     <tr>
-                                        <td><pre>${escapeHtml(sub.prompt)}</pre></td>
+                                        <td><div style="position:relative;"><button class="btn-copy" onclick="copyText(this, 'p-${sub.id}')">📋 Copy</button><pre id="p-${sub.id}">${escapeHtml(sub.prompt)}</pre></div></td>
                                         <td>
-                                            ${sub.response ? `<pre>${escapeHtml(sub.response)}</pre>` : '<em style="color:#64748b;">(No response payload)</em>'}
+                                            ${sub.response ? `<div style="position:relative;"><button class="btn-copy" onclick="copyText(this, 'r-${sub.id}')">📋 Copy</button><pre id="r-${sub.id}">${escapeHtml(sub.response)}</pre></div>` : '<em style="color:#64748b;">(No response payload)</em>'}
                                             ${sub.audit_notes ? `<div class="sub-meta" style="margin-top:6px;">${certBadge} <strong>Audit:</strong>${escapeHtml(sub.audit_notes)}</div>` : ''}
                                         </td>
                                     </tr>
@@ -331,7 +350,7 @@
 
                 let tBody = document.getElementById('token-table-body');
                 let currentTokenHash = data.data.map(t => t.turn_id + t.total_tokens).join('|');
-                if (tBody.getAttribute('data-hash') === currentTokenHash) return; // No UI flicker
+                if (tBody.getAttribute('data-hash') === currentTokenHash) return; 
 
                 let htmlStrAll = "";
                 data.data.forEach(t => {
@@ -339,9 +358,7 @@
                     let isOpen = openDetails.has('det-' + t.turn_id) ? 'open' : '';
                     let breakdownHtml = `<details id="det-${t.turn_id}" ontoggle="toggleDetails('det-${t.turn_id}', this.open)" ${isOpen}><summary style="cursor:pointer; color:#38bdf8;">View Breakdown</summary><div style="margin-top:8px; font-size:11px;">`;
                     t.subrequests.forEach(s => {
-                        if(s.total_tokens > 0) {
-                            breakdownHtml += `<div style="margin-bottom:4px;"><strong style="color:#c7d2fe;">${s.phase_type}</strong><br><span style="color:#94a3b8;">${s.prompt_tokens}p + ${s.completion_tokens}c = ${s.total_tokens}</span></div>`;
-                        }
+                        if(s.total_tokens > 0) { breakdownHtml += `<div style="margin-bottom:4px;"><strong style="color:#c7d2fe;">${s.phase_type}</strong><br><span style="color:#94a3b8;">${s.prompt_tokens}p + ${s.completion_tokens}c = ${s.total_tokens}</span></div>`; }
                     });
                     breakdownHtml += `</div></details>`;
                     
@@ -359,10 +376,7 @@
             } catch(e) { console.error("Token API error", e); }
         }
 
-        function toggleTurn(id) {
-            const el = document.getElementById(id);
-            if (el) { el.classList.toggle('open'); el.classList.contains('open') ? openTurns.add(id) : openTurns.delete(id); }
-        }
+        function toggleTurn(id) { const el = document.getElementById(id); if (el) { el.classList.toggle('open'); el.classList.contains('open') ? openTurns.add(id) : openTurns.delete(id); } }
         function toggleDetails(id, isOpen) { isOpen ? openDetails.add(id) : openDetails.delete(id); }
         
         function prevPage(tab) { if (tab === 'traces' && tracePage > 1) { tracePage--; fetchLogs(); } if (tab === 'tokens' && tokenPage > 1) { tokenPage--; fetchTokens(); } }
@@ -376,8 +390,8 @@
         async function setRouting(force) { await fetch('/api/routing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force_delegate: force }) }); fetchQueueState(); }
         async function resolve(id, action) { await fetch(`/api/resolve/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action }) }); fetchQueueState(); fetchLogs(); }
 
-        setInterval(fetchQueueState, 1500);
-        setInterval(() => { if (currentTab === 'traces') fetchLogs(); if (currentTab === 'tokens') fetchTokens(); }, 5000);
+        setInterval(() => { if (!pauseQueue) fetchQueueState(); }, 1500);
+        setInterval(() => { if (currentTab === 'traces' && !pauseLogs) fetchLogs(); if (currentTab === 'tokens') fetchTokens(); }, 5000);
         fetchQueueState(); fetchLogs();
     </script>
 </body>
