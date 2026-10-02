@@ -165,6 +165,7 @@ class QueueRecord(BaseModel):
 class ProxyState:
     def __init__(self):
         self.policy: GatePolicy = GatePolicy.MANUAL_APPROVE_ALL
+        self.force_delegate: bool = False
         self.queue: Dict[str, QueueRecord] = {}
 
 state = ProxyState()
@@ -281,23 +282,37 @@ def extract_specs(raw_text: str) -> tuple[Optional[str], Optional[str]]:
     return s_match.group(1).strip() if s_match else None, f_match.group(1).strip() if f_match else None
 
 # ==========================================
-# Core Adaptive Pipeline (Sequential Logic Fix)
+# Core Adaptive Pipeline (Clean Cancellation)
 # ==========================================
 async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_history: List[Dict[str, str]]):
     await db_start_turn(turn_id, user_query)
     step = 1
-
     thinking_open = True
+    verifier_task = None  # Track background tasks for clean termination
+
     yield format_sse("<think>\n=== 1. LOCAL TRIAGE ===\n")
 
     try:
-        triage_sys = (
-            "You are an air-gapped scientific lead architect. Analyze the user's query in context.\n"
-            "Determine if this request requires delegating a dense mathematical/algorithmic bottleneck "
-            "to external frontier oracle solvers, or if it can be resolved locally.\n\n"
-            "Format your decision STRICTLY as:\nDECISION: [LOCAL or DELEGATE]\nREASON: [Brief justification]\n\n"
-            "If DELEGATE, append:\n===SOLVER_SPEC===\n<stateless abstract prompt>\n===FALSIFICATION_SPEC===\n<stateless declarative proposition>"
-        )
+        if state.force_delegate:
+            triage_sys = (
+                "You are an air-gapped scientific lead architect. The user has FORCED this request to be delegated to external frontier oracle solvers.\n"
+                "You MUST output STRICTLY as:\n"
+                "DECISION: DELEGATE\n"
+                "REASON: User enforced routing policy overrides local assessment.\n"
+                "===SOLVER_SPEC===\n"
+                "<stateless abstract prompt>\n"
+                "===FALSIFICATION_SPEC===\n"
+                "<stateless declarative proposition>"
+            )
+            yield format_sse("> Forced Egress Routing Engaged. Overriding local assessment...\n")
+        else:
+            triage_sys = (
+                "You are an air-gapped scientific lead architect. Analyze the user's query in context.\n"
+                "Determine if this request requires delegating a dense mathematical/algorithmic bottleneck "
+                "to external frontier oracle solvers, or if it can be resolved locally.\n\n"
+                "Format your decision STRICTLY as:\nDECISION: [LOCAL or DELEGATE]\nREASON: [Brief justification]\n\n"
+                "If DELEGATE, append:\n===SOLVER_SPEC===\n<stateless abstract prompt>\n===FALSIFICATION_SPEC===\n<stateless declarative proposition>"
+            )
 
         triage_payload = build_payload(triage_sys, conversation_history, f"EVALUATE AND ROUTE THIS REQUEST:\n{user_query}")
         
@@ -412,8 +427,7 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 await db_record_subrequest(str(uuid.uuid4()), turn_id, step, f_lat, f"PROPOSITION_SYNTHESIS_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", solver_spec, falsification_spec, "N/A", "Synthesized missing invariant", "COMPLETED", f_usg.get("prompt_tokens", 0), f_usg.get("completion_tokens", 0), f_usg.get("total_tokens", 0))
                 step += 1
 
-            # We audit both specifications concurrently to check for leaks
-            yield format_sse("> Auditing Prompts for Leakage...\n")
+            yield format_sse("> Auditing Prompts...\n")
             s_cert, s_notes, s_raw = await evaluate_audit_certainty(solver_spec, turn_id, step)
             v_cert, v_notes, v_raw = await evaluate_audit_certainty(falsification_spec, turn_id, step + 1)
             step += 2
@@ -421,7 +435,6 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             rec_solver = QueueRecord(id=str(uuid.uuid4()), turn_id=turn_id, round_idx=correction_round, created_at=time.time(), target_provider=f"Provider 1 ({PROVIDER1_MODEL_NAME})", spec_type=f"solver_r{correction_round}", prompt_text=solver_spec, certainty=s_cert, audit_notes=s_notes, evaluator_raw_response=s_raw)
             rec_verifier = QueueRecord(id=str(uuid.uuid4()), turn_id=turn_id, round_idx=correction_round, created_at=time.time(), target_provider=f"Provider 2 ({PROVIDER2_MODEL_NAME})" if PROVIDER2_ENABLED else f"Local Keystone ({LOCAL_MODEL_NAME})", spec_type=f"verifier_r{correction_round}", prompt_text=falsification_spec, certainty=v_cert, audit_notes=v_notes, evaluator_raw_response=v_raw)
 
-            # Concurrent Gating: User approves both rules at the exact same time
             yield format_sse("> Awaiting Gateway Approvals...\n")
             if PROVIDER2_ENABLED:
                 approved_s, approved_v = await asyncio.gather(queue_and_await_approval(rec_solver, step), queue_and_await_approval(rec_verifier, step + 1))
@@ -432,7 +445,31 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 step += 1
                 if not approved_s: raise HTTPException(status_code=403, detail="Solver spec rejected.")
 
-            # SEQUENTIAL EXECUTION: The Solver runs first.
+            yield format_sse("> Dispatched to External Solvers...\n")
+
+            async def run_verifier(step_idx: int):
+                # Wrapped inside task so it can be cleanly cancelled if main thread aborts
+                actual_referee_prompt = (
+                    f"Evaluate the following derived solution against the stated constraints:\n\n"
+                    f"CONSTRAINTS / PROPOSITION:\n{falsification_spec}\n\n"
+                    f"DERIVED SOLUTION:\n{final_solver_res}\n\n"
+                    f"If the solution violates the constraints, misses requirements, or contains an admissible flaw, output 'VERDICT: FALSIFIED' and explain the flaw.\n"
+                    f"If the solution strictly satisfies all constraints and is unconditionally sound, output 'VERDICT: SOUND'."
+                )
+                
+                v_cert_val = v_cert.value
+                verifier_api_base = PROVIDER2_API_BASE if PROVIDER2_ENABLED else LOCAL_API_BASE
+                verifier_api_key = PROVIDER2_API_KEY if PROVIDER2_ENABLED else LOCAL_API_KEY
+                verifier_model = PROVIDER2_MODEL_NAME if PROVIDER2_ENABLED else LOCAL_MODEL_NAME
+                v_target_name = f"Provider 2 ({PROVIDER2_MODEL_NAME})" if PROVIDER2_ENABLED else f"Local Keystone ({LOCAL_MODEL_NAME})"
+                v_is_ext = True if PROVIDER2_ENABLED else False
+
+                await db_record_subrequest(str(uuid.uuid4()), turn_id, step_idx, 0.0, f"VERIFIER_R{correction_round}", v_is_ext, v_target_name, actual_referee_prompt, "[Streaming in progress...]", v_cert_val, "Referee check started", "IN_PROGRESS")
+
+                ans, lat, usg = await call_llm(verifier_api_base, verifier_api_key, verifier_model, [{"role": "user", "content": actual_referee_prompt}], max_tokens=None)
+                await db_record_subrequest(str(uuid.uuid4()), turn_id, step_idx, lat, f"VERIFIER_R{correction_round}", v_is_ext, v_target_name, actual_referee_prompt, ans, v_cert_val, "Impartial referee check completed", "COMPLETED", usg.get("prompt_tokens", 0), usg.get("completion_tokens", 0), usg.get("total_tokens", 0))
+                return ans
+
             yield format_sse(f"\n--- SOLVER DERIVATION (Provider 1) ---\n")
             final_solver_res = ""
             solver_step_id = str(uuid.uuid4())
@@ -448,36 +485,14 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                     await db_record_subrequest(solver_step_id, turn_id, step, lat, f"EXTERNAL_SOLVER_R{correction_round}", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", solver_spec, final_solver_res, s_cert.value, "Frontier derivation completed", "COMPLETED", usg.get("prompt_tokens", 0), usg.get("completion_tokens", 0), usg.get("total_tokens", 0))
             step += 1
 
-            # SEQUENTIAL EXECUTION: The Verifier evaluates the actual derived solution
-            yield format_sse(f"\n\n--- REFEREE VERDICT ---\n")
-            final_verifier_res = ""
-            verifier_step_id = str(uuid.uuid4())
-            
-            actual_referee_prompt = (
-                f"Evaluate the following derived solution against the stated constraints:\n\n"
-                f"CONSTRAINTS / PROPOSITION:\n{falsification_spec}\n\n"
-                f"DERIVED SOLUTION:\n{final_solver_res}\n\n"
-                f"If the solution violates the constraints, misses requirements, or contains an admissible flaw, output 'VERDICT: FALSIFIED' and explain the flaw.\n"
-                f"If the solution strictly satisfies all constraints and is unconditionally sound, output 'VERDICT: SOUND'."
-            )
-
-            verifier_api_base = PROVIDER2_API_BASE if PROVIDER2_ENABLED else LOCAL_API_BASE
-            verifier_api_key = PROVIDER2_API_KEY if PROVIDER2_ENABLED else LOCAL_API_KEY
-            verifier_model = PROVIDER2_MODEL_NAME if PROVIDER2_ENABLED else LOCAL_MODEL_NAME
-            v_target_name = f"Provider 2 ({PROVIDER2_MODEL_NAME})" if PROVIDER2_ENABLED else f"Local Keystone ({LOCAL_MODEL_NAME})"
-            v_is_ext = True if PROVIDER2_ENABLED else False
-
-            await db_record_subrequest(verifier_step_id, turn_id, step, 0.0, f"VERIFIER_R{correction_round}", v_is_ext, v_target_name, actual_referee_prompt, "[Streaming in progress...]", v_cert.value, "Referee check started", "IN_PROGRESS")
-
-            async for c_content, c_reasoning, finish_data in stream_llm(verifier_api_base, verifier_api_key, verifier_model, [{"role": "user", "content": actual_referee_prompt}]):
-                if c_reasoning: yield format_sse(c_reasoning)
-                if c_content:
-                    final_verifier_res += c_content
-                    yield format_sse(c_content)
-                if finish_data:
-                    lat, usg = finish_data
-                    await db_record_subrequest(verifier_step_id, turn_id, step, lat, f"VERIFIER_R{correction_round}", v_is_ext, v_target_name, actual_referee_prompt, final_verifier_res, v_cert.value, "Impartial referee check completed", "COMPLETED", usg.get("prompt_tokens", 0), usg.get("completion_tokens", 0), usg.get("total_tokens", 0))
+            yield format_sse(f"\n\n> Waiting for Referee Verdict...\n")
+            # Create the verifier task ONLY AFTER the solver is complete so it can read the homework
+            verifier_task = asyncio.create_task(run_verifier(step))
+            final_verifier_res = await verifier_task
+            verifier_task = None
             step += 1
+
+            yield format_sse(f"\n--- REFEREE VERDICT ---\n{final_verifier_res}\n")
 
             if "VERDICT: FALSIFIED" in final_verifier_res:
                 if correction_round < MAX_CORRECTION_ROUNDS:
@@ -535,6 +550,9 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
         return
 
     except asyncio.CancelledError:
+        # CLEAN CANCELLATION: Actively sweep and destroy any orphaned background verification tasks
+        if verifier_task and not verifier_task.done():
+            verifier_task.cancel()
         await db_finish_turn(turn_id, "CANCELLED_BY_USER")
         raise
     except BaseException as e:
@@ -592,6 +610,7 @@ async def chat_completions(request: Request):
 
     async def consumer():
         prod_task = asyncio.create_task(producer())
+        is_cancelled = False
         try:
             while True:
                 try:
@@ -601,27 +620,35 @@ async def chat_completions(request: Request):
                     yield chunk
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            is_cancelled = True
+            raise
         finally:
             if not prod_task.done():
                 prod_task.cancel()
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens) FROM turn_subrequests WHERE turn_id = ?", (turn_id,))
-        row = c.fetchone()
-        conn.close()
-        if row and row[2]:
-            usage_chunk = {
-                "id": f"chatcmpl-{turn_id}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": "BorrowModel",
-                "choices": [],
-                "usage": {"prompt_tokens": row[0] or 0, "completion_tokens": row[1] or 0, "total_tokens": row[2] or 0}
-            }
-            yield f"data: {json.dumps(usage_chunk)}\n\n"
-        
-        yield "data: [DONE]\n\n"
+                try:
+                    await prod_task
+                except asyncio.CancelledError:
+                    pass
+            
+            if not is_cancelled:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens) FROM turn_subrequests WHERE turn_id = ?", (turn_id,))
+                row = c.fetchone()
+                conn.close()
+                if row and row[2]:
+                    usage_chunk = {
+                        "id": f"chatcmpl-{turn_id}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": "BorrowModel",
+                        "choices": [],
+                        "usage": {"prompt_tokens": row[0] or 0, "completion_tokens": row[1] or 0, "total_tokens": row[2] or 0}
+                    }
+                    yield f"data: {json.dumps(usage_chunk)}\n\n"
+                
+                yield "data: [DONE]\n\n"
 
     return StreamingResponse(consumer(), media_type="text/event-stream")
 
@@ -633,7 +660,7 @@ async def get_dashboard():
 @app.get("/api/state")
 async def get_api_state():
     async with state_lock:
-        return {"policy": state.policy.value, "queue": [r.model_dump() for r in state.queue.values()]}
+        return {"policy": state.policy.value, "force_delegate": state.force_delegate, "queue": [r.model_dump() for r in state.queue.values()]}
 
 @app.get("/api/logs")
 async def get_paginated_logs(page: int = 1, page_size: int = 10):
@@ -668,39 +695,22 @@ async def get_token_stats(page: int = 1, page_size: int = 25):
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    
     c.execute("SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens) FROM turn_subrequests")
     totals = c.fetchone()
-    
     c.execute("SELECT COUNT(DISTINCT turn_id) FROM turn_subrequests")
     total_turns = c.fetchone()[0]
-    
     offset = (page - 1) * page_size
-    c.execute("""
-        SELECT turn_id, MAX(created_at) as started, 
-               SUM(prompt_tokens) as pt, SUM(completion_tokens) as ct, SUM(total_tokens) as tt
-        FROM turn_subrequests 
-        GROUP BY turn_id 
-        ORDER BY started DESC 
-        LIMIT ? OFFSET ?
-    """, (page_size, offset))
+    c.execute("SELECT turn_id, MAX(created_at) as started, SUM(prompt_tokens) as pt, SUM(completion_tokens) as ct, SUM(total_tokens) as tt FROM turn_subrequests GROUP BY turn_id ORDER BY started DESC LIMIT ? OFFSET ?", (page_size, offset))
     turns = c.fetchall()
     
     data = []
     for t in turns:
         c.execute("SELECT phase_type, target_engine, prompt_tokens, completion_tokens, total_tokens FROM turn_subrequests WHERE turn_id = ? ORDER BY step_order ASC", (t["turn_id"],))
         subs = [dict(row) for row in c.fetchall()]
-        data.append({
-            "turn_id": t["turn_id"], "started": t["started"], "prompt_tokens": t["pt"], "completion_tokens": t["ct"], "total_tokens": t["tt"], "subrequests": subs
-        })
+        data.append({"turn_id": t["turn_id"], "started": t["started"], "prompt_tokens": t["pt"], "completion_tokens": t["ct"], "total_tokens": t["tt"], "subrequests": subs})
         
     conn.close()
-    return {
-        "totals": {"prompt": totals[0] or 0, "completion": totals[1] or 0, "total": totals[2] or 0},
-        "page": page, "page_size": page_size, "total_turns": total_turns,
-        "total_pages": (total_turns + page_size - 1) // page_size if total_turns > 0 else 1,
-        "data": data
-    }
+    return {"totals": {"prompt": totals[0] or 0, "completion": totals[1] or 0, "total": totals[2] or 0}, "page": page, "page_size": page_size, "total_turns": total_turns, "total_pages": (total_turns + page_size - 1) // page_size if total_turns > 0 else 1, "data": data}
 
 @app.post("/api/policy")
 async def update_policy(payload: Dict[str, str]):
@@ -709,6 +719,13 @@ async def update_policy(payload: Dict[str, str]):
         async with state_lock: state.policy = GatePolicy(new_policy)
         return {"status": "ok", "policy": state.policy}
     raise HTTPException(status_code=400, detail="Invalid policy.")
+
+@app.post("/api/routing")
+async def update_routing(payload: Dict[str, bool]):
+    force = payload.get("force_delegate", False)
+    async with state_lock:
+        state.force_delegate = force
+    return {"status": "ok", "force_delegate": state.force_delegate}
 
 @app.post("/api/resolve/{req_id}")
 async def resolve_request(req_id: str, payload: Dict[str, str]):

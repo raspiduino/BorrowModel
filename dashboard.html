@@ -82,12 +82,21 @@
 
         <!-- TAB 1: EXECUTION TRACES -->
         <div id="tab-traces" class="tab-content active">
-            <div class="card">
-                <h2>Egress Gating Policy</h2>
-                <div class="policy-group">
-                    <button class="policy-btn" id="btn-manual" onclick="setPolicy('manual')">Manual-Approve All</button>
-                    <button class="policy-btn" id="btn-confidence" onclick="setPolicy('confidence')">Confidence-Based (Clean Passes, Uncertain Queues)</button>
-                    <button class="policy-btn" id="btn-auto" onclick="setPolicy('auto')">Auto-Approve All</button>
+            <div class="card" style="display: flex; gap: 40px; flex-wrap: wrap;">
+                <div>
+                    <h2>Routing Strategy</h2>
+                    <div class="policy-group">
+                        <button class="policy-btn" id="btn-route-auto" onclick="setRouting(false)">Auto-Adaptive (Local First)</button>
+                        <button class="policy-btn" id="btn-route-force" onclick="setRouting(true)">Force Egress Delegation</button>
+                    </div>
+                </div>
+                <div>
+                    <h2>Egress Gating Policy</h2>
+                    <div class="policy-group">
+                        <button class="policy-btn" id="btn-manual" onclick="setPolicy('manual')">Manual-Approve All</button>
+                        <button class="policy-btn" id="btn-confidence" onclick="setPolicy('confidence')">Confidence-Based</button>
+                        <button class="policy-btn" id="btn-auto" onclick="setPolicy('auto')">Auto-Approve All</button>
+                    </div>
                 </div>
             </div>
 
@@ -200,6 +209,14 @@
                 if (data.policy === 'confidence') document.getElementById('btn-confidence').classList.add('active');
                 if (data.policy === 'manual') document.getElementById('btn-manual').classList.add('active');
 
+                if (data.force_delegate) {
+                    document.getElementById('btn-route-force').classList.add('active');
+                    document.getElementById('btn-route-auto').classList.remove('active');
+                } else {
+                    document.getElementById('btn-route-auto').classList.add('active');
+                    document.getElementById('btn-route-force').classList.remove('active');
+                }
+
                 document.getElementById('queue-count').innerText = data.queue.length;
                 const qContainer = document.getElementById('queue-container');
                 if (data.queue.length === 0) {
@@ -257,7 +274,7 @@
                                     <span class="metric-pill">📡 External: <strong style="color:${m.external_count > 0 ? '#fdba74' : '#64748b'};">${m.external_count}</strong></span>
                                     <span class="metric-pill">🔒 Local: <strong style="color:#c7d2fe;">${m.local_count}</strong></span>
                                     <span class="metric-pill">🪙 Tokens: <strong style="color:#38bdf8;">${m.total_tokens}</strong></span>
-                                    <span class="metric-pill" style="color:${turn.status.startsWith('FAILED') ? '#f87171' : '#34d399'}">${turn.status}</span>
+                                    <span class="metric-pill" style="color:${turn.status.startsWith('FAILED') || turn.status.startsWith('CANCELLED') ? '#f87171' : '#34d399'}">${turn.status}</span>
                                 </div>
                             </div>
                             <div class="turn-body ${openTurns.has('body-' + turn.turn_id) ? 'open' : ''}" id="body-${turn.turn_id}">
@@ -356,6 +373,7 @@
         }
 
         async function setPolicy(p) { await fetch('/api/policy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: p }) }); fetchQueueState(); }
+        async function setRouting(force) { await fetch('/api/routing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force_delegate: force }) }); fetchQueueState(); }
         async function resolve(id, action) { await fetch(`/api/resolve/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action }) }); fetchQueueState(); fetchLogs(); }
 
         setInterval(fetchQueueState, 1500);
