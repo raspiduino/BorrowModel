@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 import httpx
 
 # ==========================================
-# Configuration & Environment
+# Configuration & Environment Fallbacks
 # ==========================================
 HOST = os.getenv("PROXY_HOST", "127.0.0.1")
 PORT = int(os.getenv("PROXY_PORT", "9908"))
@@ -49,7 +49,7 @@ app.add_middleware(
 )
 
 # ==========================================
-# Database Concurrency Engine
+# Database Concurrency Engine (WAL Mode)
 # ==========================================
 db_write_lock = asyncio.Lock()
 state_lock = asyncio.Lock()
@@ -88,7 +88,6 @@ def init_db():
             FOREIGN KEY (turn_id) REFERENCES user_turns(id)
         )
     """)
-    # Migration safeguard
     for col in ["prompt_tokens", "completion_tokens", "total_tokens"]:
         try:
             c.execute(f"ALTER TABLE turn_subrequests ADD COLUMN {col} INTEGER DEFAULT 0;")
@@ -186,20 +185,20 @@ async def call_llm(base_url: str, api_key: str, model: str, messages: List[Dict[
     if max_tokens: payload["max_tokens"] = max_tokens
         
     start_t = time.perf_counter()
-    async with httpx.AsyncClient(timeout=180.0) as client:
+    async with httpx.AsyncClient(timeout=600.0) as client:
         res = await client.post(f"{base_url.rstrip('/')}/chat/completions", headers=headers, json=payload)
         latency = (time.perf_counter() - start_t) * 1000.0
         if res.status_code != 200:
             raise HTTPException(status_code=502, detail=f"LLM upstream error ({base_url}): {res.text}")
         data = res.json()
         usage = data.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
-        return data["choices"][0]["message"]["content"], latency, usage
+        return data["choices"][0]["message"].get("content", ""), latency, usage
 
 async def stream_llm(base_url: str, api_key: str, model: str, messages: List[Dict[str, str]], temperature: float = 0.0):
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "temperature": temperature, "stream": True, "stream_options": {"include_usage": True}}
     start_t = time.perf_counter()
-    async with httpx.AsyncClient(timeout=180.0) as client:
+    async with httpx.AsyncClient(timeout=600.0) as client:
         async with client.stream("POST", f"{base_url.rstrip('/')}/chat/completions", headers=headers, json=payload) as res:
             if res.status_code != 200:
                 err = await res.aread()
@@ -212,29 +211,39 @@ async def stream_llm(base_url: str, api_key: str, model: str, messages: List[Dic
                         data = json.loads(line[6:])
                         if "choices" in data and len(data["choices"]) > 0:
                             delta = data["choices"][0].get("delta", {})
-                            if "content" in delta and delta["content"]:
-                                yield delta["content"], None
+                            chunk_content = delta.get("content", "") or ""
+                            chunk_reasoning = delta.get("reasoning_content", "") or ""
+                            if chunk_content or chunk_reasoning:
+                                yield chunk_content, chunk_reasoning, None
                         if "usage" in data and data["usage"]:
                             final_usage = data["usage"]
                     except json.JSONDecodeError: pass
             latency = (time.perf_counter() - start_t) * 1000.0
-            yield "", (latency, final_usage)
+            yield "", "", (latency, final_usage)
 
 async def evaluate_audit_certainty(abstract_prompt: str, turn_id: str, step_order: int) -> tuple[AuditCertainty, str, str]:
     sys_prompt = (
         "You are an adversarial industrial espionage auditor. Judge if this text leaks proprietary architecture or intent.\n"
-        "Respond STRICTLY in JSON: {'certainty': 'high_certainty_clean'|'uncertain'|'flagged_leak', 'notes': '...'}"
+        "Respond STRICTLY in JSON format: {\"certainty\": \"high_certainty_clean\"|\"uncertain\"|\"flagged_leak\", \"notes\": \"...\"}"
     )
-    raw_response, latency, usage = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, 
-                                                  [{"role": "system", "content": sys_prompt}, {"role": "user", "content": abstract_prompt}])
+    
+    op_id = str(uuid.uuid4())
     try:
-        match = re.search(r"\{.*\}", raw_response, re.DOTALL)
-        parsed = json.loads(match.group(0)) if match else json.loads(raw_response)
-        certainty, notes = AuditCertainty(parsed.get("certainty", "uncertain")), parsed.get("notes", "No notes.")
-    except Exception:
-        certainty, notes = AuditCertainty.UNCERTAIN, "JSON parse error."
+        raw_response, latency, usage = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, 
+                                                      [{"role": "system", "content": sys_prompt}, {"role": "user", "content": abstract_prompt}])
+        clean_res = re.sub(r"<think>.*?(</think>|$)", "", raw_response, flags=re.DOTALL | re.IGNORECASE).strip()
+        match = re.search(r"\{.*\}", clean_res, re.DOTALL)
+        parsed = json.loads(match.group(0)) if match else json.loads(clean_res)
+        certainty = AuditCertainty(parsed.get("certainty", "uncertain"))
+        notes = parsed.get("notes", "No detailed reasoning provided.")
+    except Exception as e:
+        certainty = AuditCertainty.UNCERTAIN
+        notes = f"Audit skipped due to local model parsing/timeout error: {str(e)}"
+        raw_response = raw_response if 'raw_response' in locals() else ""
+        latency = latency if 'latency' in locals() else 0.0
+        usage = usage if 'usage' in locals() else {}
         
-    await db_record_subrequest(str(uuid.uuid4()), turn_id, step_order, latency, "INTERNAL_AUDIT", False,
+    await db_record_subrequest(op_id, turn_id, step_order, latency, "INTERNAL_AUDIT", False,
                                f"Local ({LOCAL_MODEL_NAME})", abstract_prompt, raw_response, certainty.value, notes, "COMPLETED",
                                usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), usage.get("total_tokens", 0))
     return certainty, notes, raw_response
@@ -272,11 +281,14 @@ def extract_specs(raw_text: str) -> tuple[Optional[str], Optional[str]]:
     return s_match.group(1).strip() if s_match else None, f_match.group(1).strip() if f_match else None
 
 # ==========================================
-# Core Adaptive Pipeline (Streaming Async Gen)
+# Core Adaptive Pipeline (Sequential Logic Fix)
 # ==========================================
 async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_history: List[Dict[str, str]]):
     await db_start_turn(turn_id, user_query)
     step = 1
+
+    thinking_open = True
+    yield format_sse("<think>\n=== 1. LOCAL TRIAGE ===\n")
 
     try:
         triage_sys = (
@@ -287,14 +299,14 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             "If DELEGATE, append:\n===SOLVER_SPEC===\n<stateless abstract prompt>\n===FALSIFICATION_SPEC===\n<stateless declarative proposition>"
         )
 
-        yield format_sse("<think>\n=== 1. LOCAL TRIAGE ===\n")
         triage_payload = build_payload(triage_sys, conversation_history, f"EVALUATE AND ROUTE THIS REQUEST:\n{user_query}")
         
         triage_raw = ""
-        async for chunk, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, triage_payload):
-            if chunk:
-                triage_raw += chunk
-                yield format_sse(chunk)
+        async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, triage_payload):
+            if c_reasoning: yield format_sse(c_reasoning)
+            if c_content:
+                triage_raw += c_content
+                yield format_sse(c_content)
             if finish_data:
                 t_lat, t_usage = finish_data
                 await db_record_subrequest(str(uuid.uuid4()), turn_id, step, t_lat, "LOCAL_TRIAGE", False, f"Local ({LOCAL_MODEL_NAME})", user_query, triage_raw, "N/A", "Assessed routing", "COMPLETED", t_usage.get("prompt_tokens", 0), t_usage.get("completion_tokens", 0), t_usage.get("total_tokens", 0))
@@ -310,14 +322,18 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             await db_update_turn_mode(turn_id, "LOCAL_ONLY")
             local_sys = "You are an expert scientific assistant. Provide a comprehensive answer directly."
             
-            yield format_sse("\n\n=== 2. DECISION ===\nRouting: Local Resolution\n</think>\n\n")
+            yield format_sse("\n\n=== 2. LOCAL EXECUTION ===\n")
             
             direct_ans = ""
             chat_payload = build_payload(local_sys, conversation_history, user_query)
-            async for chunk, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, chat_payload):
-                if chunk:
-                    direct_ans += chunk
-                    yield format_sse(chunk)
+            async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, chat_payload):
+                if c_reasoning: yield format_sse(c_reasoning)
+                if c_content:
+                    if thinking_open:
+                        yield format_sse("\n</think>\n\n")
+                        thinking_open = False
+                    direct_ans += c_content
+                    yield format_sse(c_content)
                 if finish_data:
                     a_lat, a_usage = finish_data
                     await db_record_subrequest(str(uuid.uuid4()), turn_id, step, a_lat, "LOCAL_EXECUTION", False, f"Local ({LOCAL_MODEL_NAME})", user_query, direct_ans, "N/A", "Initial local resolution", "COMPLETED", a_usage.get("prompt_tokens", 0), a_usage.get("completion_tokens", 0), a_usage.get("total_tokens", 0))
@@ -326,14 +342,20 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             correction_round = 0
             while correction_round < MAX_CORRECTION_ROUNDS:
                 correction_round += 1
-                yield format_sse(f"\n\n<think>\n=== AUDIT VERIFICATION (Round {correction_round}) ===\n")
-                falsify_prompt = f"Analyze this explanation:\n\n{direct_ans[:2500]}\n\nIf an admissible flaw exists, output: 'VERDICT: FALSIFIED' and explain.\nIf unconditionally sound, output: 'VERDICT: SOUND'"
                 
+                if not thinking_open:
+                    yield format_sse(f"\n\n<think>\n=== AUDIT VERIFICATION (Round {correction_round}) ===\n")
+                    thinking_open = True
+                else:
+                    yield format_sse(f"\n\n=== AUDIT VERIFICATION (Round {correction_round}) ===\n")
+
+                falsify_prompt = f"Analyze this explanation:\n\n{direct_ans[:2500]}\n\nIf an admissible flaw exists, output: 'VERDICT: FALSIFIED' and explain.\nIf unconditionally sound, output: 'VERDICT: SOUND'"
                 falsify_res = ""
-                async for chunk, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": falsify_prompt}, {"role": "user", "content": direct_ans[:2000]}]):
-                    if chunk:
-                        falsify_res += chunk
-                        yield format_sse(chunk)
+                async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": falsify_prompt}, {"role": "user", "content": direct_ans[:2000]}]):
+                    if c_reasoning: yield format_sse(c_reasoning)
+                    if c_content:
+                        falsify_res += c_content
+                        yield format_sse(c_content)
                     if finish_data:
                         f_lat, f_usage = finish_data
                         await db_record_subrequest(str(uuid.uuid4()), turn_id, step, f_lat, f"LOCAL_FALSIFICATION_CHECK_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", direct_ans[:500] + "...", falsify_res, "N/A", f"Falsification round {correction_round}", "COMPLETED", f_usage.get("prompt_tokens", 0), f_usage.get("completion_tokens", 0), f_usage.get("total_tokens", 0))
@@ -342,23 +364,30 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 if "VERDICT: FALSIFIED" in falsify_res:
                     if correction_round < MAX_CORRECTION_ROUNDS:
                         counterexample = falsify_res.split("VERDICT: FALSIFIED")[-1].strip()
-                        yield format_sse("\n\n=== RE-GENERATING SOLUTION ===\n</think>\n\n")
+                        yield format_sse("\n\n=== RE-GENERATING SOLUTION ===\n")
                         re_prompt = f"ORIGINAL GOAL: {user_query}\n\nYOUR PREVIOUS ANSWER:\n{direct_ans}\n\nREFEREE'S REFUTATION:\n{counterexample}\n\nRe-answer comprehensively, explicitly resolving this counterexample."
                         direct_ans = ""
-                        async for chunk, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(local_sys, conversation_history, re_prompt)):
-                            if chunk:
-                                direct_ans += chunk
-                                yield format_sse(chunk)
+                        async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(local_sys, conversation_history, re_prompt)):
+                            if c_reasoning: yield format_sse(c_reasoning)
+                            if c_content:
+                                if thinking_open:
+                                    yield format_sse("\n</think>\n\n")
+                                    thinking_open = False
+                                direct_ans += c_content
+                                yield format_sse(c_content)
                             if finish_data:
                                 r_lat, r_usage = finish_data
                                 await db_record_subrequest(str(uuid.uuid4()), turn_id, step, r_lat, f"LOCAL_CORRECTION_REANSWER_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", counterexample, direct_ans, "N/A", "Corrected answer re-synthesized", "COMPLETED", r_usage.get("prompt_tokens", 0), r_usage.get("completion_tokens", 0), r_usage.get("total_tokens", 0))
                         step += 1
                     else:
-                        yield format_sse(f"\n\n⚠ Boundary Warning: Verification unresolved after {MAX_CORRECTION_ROUNDS} rounds.</think>\n")
+                        yield format_sse(f"\n\n⚠️ Boundary Warning: Verification unresolved after {MAX_CORRECTION_ROUNDS} rounds.\n")
                         break
                 else:
-                    yield format_sse("\n</think>\n")
                     break
+
+            if thinking_open:
+                yield format_sse("\n</think>\n\n")
+                thinking_open = False
 
             await db_finish_turn(turn_id, "COMPLETED")
             return
@@ -367,7 +396,7 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
         # BRANCH B: HYBRID EGRESS DELEGATION
         # ====================================================
         await db_update_turn_mode(turn_id, "HYBRID_EGRESS")
-        yield format_sse("\n\n=== 2. DECISION ===\nRouting: Hybrid Egress Delegation\n")
+        yield format_sse("\n\n=== 2. ROUTING: HYBRID EGRESS DELEGATION ===\n")
 
         correction_round = 0
         all_clear = False
@@ -383,16 +412,16 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 await db_record_subrequest(str(uuid.uuid4()), turn_id, step, f_lat, f"PROPOSITION_SYNTHESIS_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", solver_spec, falsification_spec, "N/A", "Synthesized missing invariant", "COMPLETED", f_usg.get("prompt_tokens", 0), f_usg.get("completion_tokens", 0), f_usg.get("total_tokens", 0))
                 step += 1
 
-            referee_prompt = f"Evaluate this declarative proposition:\n\n{falsification_spec}\n\nIf an admissible counterexample exists, output 'VERDICT: FALSIFIED' and explain.\nIf unconditionally sound, output 'VERDICT: SOUND'."
-
-            yield format_sse("> Auditing Prompts...\n")
+            # We audit both specifications concurrently to check for leaks
+            yield format_sse("> Auditing Prompts for Leakage...\n")
             s_cert, s_notes, s_raw = await evaluate_audit_certainty(solver_spec, turn_id, step)
-            v_cert, v_notes, v_raw = await evaluate_audit_certainty(referee_prompt, turn_id, step + 1)
+            v_cert, v_notes, v_raw = await evaluate_audit_certainty(falsification_spec, turn_id, step + 1)
             step += 2
 
             rec_solver = QueueRecord(id=str(uuid.uuid4()), turn_id=turn_id, round_idx=correction_round, created_at=time.time(), target_provider=f"Provider 1 ({PROVIDER1_MODEL_NAME})", spec_type=f"solver_r{correction_round}", prompt_text=solver_spec, certainty=s_cert, audit_notes=s_notes, evaluator_raw_response=s_raw)
-            rec_verifier = QueueRecord(id=str(uuid.uuid4()), turn_id=turn_id, round_idx=correction_round, created_at=time.time(), target_provider=f"Provider 2 ({PROVIDER2_MODEL_NAME})" if PROVIDER2_ENABLED else f"Local Keystone ({LOCAL_MODEL_NAME})", spec_type=f"verifier_r{correction_round}", prompt_text=referee_prompt, certainty=v_cert, audit_notes=v_notes, evaluator_raw_response=v_raw)
+            rec_verifier = QueueRecord(id=str(uuid.uuid4()), turn_id=turn_id, round_idx=correction_round, created_at=time.time(), target_provider=f"Provider 2 ({PROVIDER2_MODEL_NAME})" if PROVIDER2_ENABLED else f"Local Keystone ({LOCAL_MODEL_NAME})", spec_type=f"verifier_r{correction_round}", prompt_text=falsification_spec, certainty=v_cert, audit_notes=v_notes, evaluator_raw_response=v_raw)
 
+            # Concurrent Gating: User approves both rules at the exact same time
             yield format_sse("> Awaiting Gateway Approvals...\n")
             if PROVIDER2_ENABLED:
                 approved_s, approved_v = await asyncio.gather(queue_and_await_approval(rec_solver, step), queue_and_await_approval(rec_verifier, step + 1))
@@ -403,26 +432,52 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 step += 1
                 if not approved_s: raise HTTPException(status_code=403, detail="Solver spec rejected.")
 
-            yield format_sse("> Dispatched to External Solvers...\n")
+            # SEQUENTIAL EXECUTION: The Solver runs first.
+            yield format_sse(f"\n--- SOLVER DERIVATION (Provider 1) ---\n")
+            final_solver_res = ""
+            solver_step_id = str(uuid.uuid4())
+            await db_record_subrequest(solver_step_id, turn_id, step, 0.0, f"EXTERNAL_SOLVER_R{correction_round}", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", solver_spec, "[Streaming in progress...]", s_cert.value, "Frontier derivation started", "IN_PROGRESS")
+            
+            async for c_content, c_reasoning, finish_data in stream_llm(PROVIDER1_API_BASE, PROVIDER1_API_KEY, PROVIDER1_MODEL_NAME, [{"role": "user", "content": solver_spec}]):
+                if c_reasoning: yield format_sse(c_reasoning)
+                if c_content:
+                    final_solver_res += c_content
+                    yield format_sse(c_content)
+                if finish_data:
+                    lat, usg = finish_data
+                    await db_record_subrequest(solver_step_id, turn_id, step, lat, f"EXTERNAL_SOLVER_R{correction_round}", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", solver_spec, final_solver_res, s_cert.value, "Frontier derivation completed", "COMPLETED", usg.get("prompt_tokens", 0), usg.get("completion_tokens", 0), usg.get("total_tokens", 0))
+            step += 1
 
-            async def run_p1(step_idx: int):
-                ans, lat, usg = await call_llm(PROVIDER1_API_BASE, PROVIDER1_API_KEY, PROVIDER1_MODEL_NAME, [{"role": "user", "content": solver_spec}])
-                await db_record_subrequest(str(uuid.uuid4()), turn_id, step_idx, lat, f"EXTERNAL_SOLVER_R{correction_round}", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", solver_spec, ans, s_cert.value, "Frontier derivation completed", "COMPLETED", usg.get("prompt_tokens", 0), usg.get("completion_tokens", 0), usg.get("total_tokens", 0))
-                return ans
+            # SEQUENTIAL EXECUTION: The Verifier evaluates the actual derived solution
+            yield format_sse(f"\n\n--- REFEREE VERDICT ---\n")
+            final_verifier_res = ""
+            verifier_step_id = str(uuid.uuid4())
+            
+            actual_referee_prompt = (
+                f"Evaluate the following derived solution against the stated constraints:\n\n"
+                f"CONSTRAINTS / PROPOSITION:\n{falsification_spec}\n\n"
+                f"DERIVED SOLUTION:\n{final_solver_res}\n\n"
+                f"If the solution violates the constraints, misses requirements, or contains an admissible flaw, output 'VERDICT: FALSIFIED' and explain the flaw.\n"
+                f"If the solution strictly satisfies all constraints and is unconditionally sound, output 'VERDICT: SOUND'."
+            )
 
-            async def run_verifier(step_idx: int):
-                if PROVIDER2_ENABLED:
-                    ans, lat, usg = await call_llm(PROVIDER2_API_BASE, PROVIDER2_API_KEY, PROVIDER2_MODEL_NAME, [{"role": "user", "content": referee_prompt}], max_tokens=512)
-                    await db_record_subrequest(str(uuid.uuid4()), turn_id, step_idx, lat, f"BLIND_FALSIFICATION_VERIFIER_R{correction_round}", True, f"Provider 2 ({PROVIDER2_MODEL_NAME})", referee_prompt, ans, v_cert.value, "Impartial referee check completed", "COMPLETED", usg.get("prompt_tokens", 0), usg.get("completion_tokens", 0), usg.get("total_tokens", 0))
-                else:
-                    ans, lat, usg = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "user", "content": referee_prompt}], max_tokens=512)
-                    await db_record_subrequest(str(uuid.uuid4()), turn_id, step_idx, lat, f"LOCAL_KEYSTONE_VERIFIER_R{correction_round}", False, f"Local Keystone ({LOCAL_MODEL_NAME})", referee_prompt, ans, "HIGH_CERTAINTY_CLEAN", "Impartial local referee check completed", "COMPLETED", usg.get("prompt_tokens", 0), usg.get("completion_tokens", 0), usg.get("total_tokens", 0))
-                return ans
+            verifier_api_base = PROVIDER2_API_BASE if PROVIDER2_ENABLED else LOCAL_API_BASE
+            verifier_api_key = PROVIDER2_API_KEY if PROVIDER2_ENABLED else LOCAL_API_KEY
+            verifier_model = PROVIDER2_MODEL_NAME if PROVIDER2_ENABLED else LOCAL_MODEL_NAME
+            v_target_name = f"Provider 2 ({PROVIDER2_MODEL_NAME})" if PROVIDER2_ENABLED else f"Local Keystone ({LOCAL_MODEL_NAME})"
+            v_is_ext = True if PROVIDER2_ENABLED else False
 
-            final_solver_res, final_verifier_res = await asyncio.gather(run_p1(step), run_verifier(step + 1))
-            step += 2
+            await db_record_subrequest(verifier_step_id, turn_id, step, 0.0, f"VERIFIER_R{correction_round}", v_is_ext, v_target_name, actual_referee_prompt, "[Streaming in progress...]", v_cert.value, "Referee check started", "IN_PROGRESS")
 
-            yield format_sse(f"\n--- SOLVER RESULT ---\n{final_solver_res}\n\n--- REFEREE VERDICT ---\n{final_verifier_res}\n")
+            async for c_content, c_reasoning, finish_data in stream_llm(verifier_api_base, verifier_api_key, verifier_model, [{"role": "user", "content": actual_referee_prompt}]):
+                if c_reasoning: yield format_sse(c_reasoning)
+                if c_content:
+                    final_verifier_res += c_content
+                    yield format_sse(c_content)
+                if finish_data:
+                    lat, usg = finish_data
+                    await db_record_subrequest(verifier_step_id, turn_id, step, lat, f"VERIFIER_R{correction_round}", v_is_ext, v_target_name, actual_referee_prompt, final_verifier_res, v_cert.value, "Impartial referee check completed", "COMPLETED", usg.get("prompt_tokens", 0), usg.get("completion_tokens", 0), usg.get("total_tokens", 0))
+            step += 1
 
             if "VERDICT: FALSIFIED" in final_verifier_res:
                 if correction_round < MAX_CORRECTION_ROUNDS:
@@ -433,10 +488,11 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                         "Formulate revised formal specifications that solve the COMPLETE original goal while explicitly eliminating this counterexample.\nFormat output EXACTLY as:\n===SOLVER_SPEC===\n<revised comprehensive solver prompt>\n===FALSIFICATION_SPEC===\n<revised formal proposition and constraints>"
                     )
                     revised_raw = ""
-                    async for chunk, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(triage_sys, conversation_history, re_spec_prompt)):
-                        if chunk:
-                            revised_raw += chunk
-                            yield format_sse(chunk)
+                    async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(triage_sys, conversation_history, re_spec_prompt)):
+                        if c_reasoning: yield format_sse(c_reasoning)
+                        if c_content:
+                            revised_raw += c_content
+                            yield format_sse(c_content)
                         if finish_data:
                             r_lat, r_usg = finish_data
                             await db_record_subrequest(str(uuid.uuid4()), turn_id, step, r_lat, f"RE_SPEC_GENERATION_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", counterexample, revised_raw, "N/A", "Re-synthesized formal specifications following refutation", "COMPLETED", r_usg.get("prompt_tokens", 0), r_usg.get("completion_tokens", 0), r_usg.get("total_tokens", 0))
@@ -448,24 +504,32 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                     else:
                         raise HTTPException(status_code=422, detail="Local enclave failed to emit valid delimiters on re-specification.")
                 else:
-                    yield format_sse(f"\n\n⚠ Boundary Warning: Verification unresolved after {MAX_CORRECTION_ROUNDS} rounds.")
+                    yield format_sse(f"\n\n⚠️ Boundary Warning: Verification unresolved after {MAX_CORRECTION_ROUNDS} rounds.\n")
                     all_clear = False
             else:
                 all_clear = True
 
-        yield format_sse("\n\n=== 3. FINAL ASSEMBLY ===\nIntegrating validated response...</think>\n\n")
+        yield format_sse("\n=== 3. FINAL INTEGRATION ===\nSynthesizing verified solution...\n")
 
         assemble_sys = "You are the local integration architect. Synthesize the user's request, external derivation, and referee report into a cohesive, verified final answer. Acknowledge boundary limitations if refuted."
         assemble_user = f"ORIGINAL QUERY:\n{user_query}\n\nEXTERNAL DERIVATION:\n{final_solver_res}\n\nREFEREE REPORT:\n{final_verifier_res}"
         
         final_res = ""
-        async for chunk, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(assemble_sys, conversation_history, assemble_user)):
-            if chunk:
-                final_res += chunk
-                yield format_sse(chunk)
+        async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(assemble_sys, conversation_history, assemble_user)):
+            if c_reasoning: yield format_sse(c_reasoning)
+            if c_content:
+                if thinking_open:
+                    yield format_sse("\n</think>\n\n")
+                    thinking_open = False
+                final_res += c_content
+                yield format_sse(c_content)
             if finish_data:
                 a_lat, a_usage = finish_data
                 await db_record_subrequest(str(uuid.uuid4()), turn_id, step, a_lat, "LOCAL_ASSEMBLY", False, f"Local ({LOCAL_MODEL_NAME})", assemble_user, final_res, "N/A", "Context reintegration completed", "COMPLETED", a_usage.get("prompt_tokens", 0), a_usage.get("completion_tokens", 0), a_usage.get("total_tokens", 0))
+
+        if thinking_open:
+            yield format_sse("\n</think>\n\n")
+            thinking_open = False
 
         await db_finish_turn(turn_id, "COMPLETED")
         return
@@ -477,6 +541,10 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
         err_trace = traceback.format_exc()
         print(f"CRITICAL ERROR in turn {turn_id}:\n{err_trace}")
         await db_finish_turn(turn_id, f"FAILED: {str(e)}")
+        if thinking_open:
+            yield format_sse(f"\n\n=== PIPELINE ERROR ===\n{err_trace}\n</think>\n\n")
+        else:
+            yield format_sse(f"\n\n❌ **Pipeline Error:**\n```\n{err_trace}\n```\n")
         raise e
 
 # ==========================================
@@ -486,7 +554,7 @@ def clean_incoming_messages(messages: List[Dict[str, str]]) -> List[Dict[str, st
     cleaned = []
     for m in messages:
         c = m.get("content", "")
-        c = re.sub(r"<think>.*?</think>", "", c, flags=re.DOTALL | re.IGNORECASE).strip()
+        c = re.sub(r"<think>.*?(</think>|$)", "", c, flags=re.DOTALL | re.IGNORECASE).strip()
         if c: cleaned.append({**m, "content": c})
     return cleaned
 
@@ -537,7 +605,6 @@ async def chat_completions(request: Request):
             if not prod_task.done():
                 prod_task.cancel()
         
-        # Fire final token usage back to Open WebUI
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens) FROM turn_subrequests WHERE turn_id = ?", (turn_id,))

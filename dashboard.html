@@ -131,7 +131,7 @@
                     <div class="stat-num" id="stat-comp">0</div>
                 </div>
                 <div class="stat-box">
-                    <div style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Total Tokens Egressed</div>
+                    <div style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Total Tokens Burned</div>
                     <div class="stat-num" id="stat-total">0</div>
                 </div>
             </div>
@@ -172,10 +172,10 @@
 
     <script>
         let currentTab = 'traces';
-        let tracePage = 1;
-        let tracePageSize = 10;
-        let tokenPage = 1;
-        let tokenPageSize = 25;
+        let tracePage = 1, tracePageSize = 10;
+        let tokenPage = 1, tokenPageSize = 25;
+        let openTurns = new Set();
+        let openDetails = new Set();
 
         function switchTab(tabName) {
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
@@ -236,32 +236,32 @@
                 const lContainer = document.getElementById('logs-container');
                 if (resData.data.length === 0) { lContainer.innerHTML = "<p style='color:#94a3b8;'>No message turns logged yet.</p>"; return; }
 
-                // Virtual DOM-lite diffing to prevent UI collapse/flickering
-                let existingIds = Array.from(lContainer.children).map(c => c.id);
-                let newIds = resData.data.map(t => `turn-${t.turn_id}`);
-                existingIds.forEach(id => { if (!newIds.includes(id)) document.getElementById(id).remove(); });
+                let currentHash = resData.data.map(t => t.turn_id + t.status + t.metrics.total_subrequests + t.metrics.total_tokens).join('|');
+                if (lContainer.getAttribute('data-hash') === currentHash) return; // Perfect virtual-dom diff skip
 
-                resData.data.forEach((turn, idx) => {
+                let htmlStrAll = "";
+                resData.data.forEach((turn) => {
                     const dateStr = new Date(turn.created_at * 1000).toLocaleTimeString();
                     const m = turn.metrics;
                     const isLocalOnly = turn.routing_mode === 'LOCAL_ONLY';
                     const modeBadge = isLocalOnly ? '<span class="badge badge-mode-local">LOCAL ENCLAVE ONLY</span>' : '<span class="badge badge-mode-hybrid">HYBRID EGRESS</span>';
                     
-                    let htmlStr = `
-                        <div class="turn-header ${isLocalOnly ? 'local-only' : ''}" onclick="toggleTurn('body-${turn.turn_id}')">
-                            <div style="display:flex; flex-direction:column; gap:4px; max-width:65%;">
-                                <div style="display:flex; align-items:center; gap:8px;">${modeBadge}<span class="turn-query">${escapeHtml(turn.raw_query)}</span></div>
-                                <div style="font-size:11px; color:#64748b;">Turn ID: ${turn.turn_id} | ${dateStr}</div>
+                    htmlStrAll += `
+                        <div class="turn-card">
+                            <div class="turn-header ${isLocalOnly ? 'local-only' : ''}" onclick="toggleTurn('body-${turn.turn_id}')">
+                                <div style="display:flex; flex-direction:column; gap:4px; max-width:65%;">
+                                    <div style="display:flex; align-items:center; gap:8px;">${modeBadge}<span class="turn-query">${escapeHtml(turn.raw_query)}</span></div>
+                                    <div style="font-size:11px; color:#64748b;">Turn ID: ${turn.turn_id} | ${dateStr}</div>
+                                </div>
+                                <div class="turn-metrics">
+                                    <span class="metric-pill">📡 External: <strong style="color:${m.external_count > 0 ? '#fdba74' : '#64748b'};">${m.external_count}</strong></span>
+                                    <span class="metric-pill">🔒 Local: <strong style="color:#c7d2fe;">${m.local_count}</strong></span>
+                                    <span class="metric-pill">🪙 Tokens: <strong style="color:#38bdf8;">${m.total_tokens}</strong></span>
+                                    <span class="metric-pill" style="color:${turn.status.startsWith('FAILED') ? '#f87171' : '#34d399'}">${turn.status}</span>
+                                </div>
                             </div>
-                            <div class="turn-metrics">
-                                <span class="metric-pill">📡 External: <strong style="color:${m.external_count > 0 ? '#fdba74' : '#64748b'};">${m.external_count}</strong></span>
-                                <span class="metric-pill">🔒 Local: <strong style="color:#c7d2fe;">${m.local_count}</strong></span>
-                                <span class="metric-pill">🪙 Tokens: <strong style="color:#38bdf8;">${m.total_tokens}</strong></span>
-                                <span class="metric-pill" style="color:${turn.status.startsWith('FAILED') ? '#f87171' : '#34d399'}">${turn.status}</span>
-                            </div>
-                        </div>
-                        <div class="turn-body" id="body-${turn.turn_id}">
-                            <div style="margin-bottom:12px; font-size:12px; color:#94a3b8;"><strong>Sub-Request Execution Pipeline:</strong></div>`;
+                            <div class="turn-body ${openTurns.has('body-' + turn.turn_id) ? 'open' : ''}" id="body-${turn.turn_id}">
+                                <div style="margin-bottom:12px; font-size:12px; color:#94a3b8;"><strong>Sub-Request Execution Pipeline:</strong></div>`;
                     
                     turn.subrequests.forEach((sub) => {
                         const isExt = sub.is_external === 1;
@@ -269,7 +269,7 @@
                         let certBadge = sub.certainty !== 'N/A' ? `<span class="badge ${sub.certainty === 'high_certainty_clean' ? 'badge-clean' : 'badge-uncertain'}">${sub.certainty}</span>` : '';
                         let tokStr = sub.total_tokens > 0 ? `<span class="token-pill">${sub.prompt_tokens}↓ + ${sub.completion_tokens}↑ = ${sub.total_tokens}</span>` : "";
 
-                        htmlStr += `
+                        htmlStrAll += `
                             <div class="timeline-step ${isExt ? '' : 'local-node'}">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
                                     <div><span class="badge ${badgeType}">Step ${sub.step_order}: ${sub.phase_type}</span><span style="font-size:12px; color:#94a3b8; margin-left:6px;">➔ ${escapeHtml(sub.target_engine)}</span></div>
@@ -289,27 +289,11 @@
                                 </table>
                             </div>`;
                     });
-                    htmlStr += `</div>`;
-
-                    let statusHash = turn.status + turn.metrics.total_subrequests + turn.metrics.total_tokens;
-                    let existingCard = document.getElementById(`turn-${turn.turn_id}`);
-                    
-                    if (!existingCard) {
-                        let card = document.createElement('div');
-                        card.className = "turn-card";
-                        card.id = `turn-${turn.turn_id}`;
-                        card.setAttribute('data-hash', statusHash);
-                        card.innerHTML = htmlStr;
-                        lContainer.appendChild(card); // Append to bottom
-                    } else if (existingCard.getAttribute('data-hash') !== statusHash) {
-                        // Update gracefully preserving open state
-                        let bodyElem = document.getElementById(`body-${turn.turn_id}`);
-                        let isOpen = bodyElem && bodyElem.classList.contains('open');
-                        existingCard.setAttribute('data-hash', statusHash);
-                        existingCard.innerHTML = htmlStr;
-                        if (isOpen) document.getElementById(`body-${turn.turn_id}`).classList.add('open');
-                    }
+                    htmlStrAll += `</div></div>`;
                 });
+
+                lContainer.innerHTML = htmlStrAll;
+                lContainer.setAttribute('data-hash', currentHash);
             } catch (err) { console.error("Log error:", err); }
         }
 
@@ -329,12 +313,14 @@
                 document.getElementById('t-next-btn').disabled = data.page >= data.total_pages;
 
                 let tBody = document.getElementById('token-table-body');
-                tBody.innerHTML = "";
+                let currentTokenHash = data.data.map(t => t.turn_id + t.total_tokens).join('|');
+                if (tBody.getAttribute('data-hash') === currentTokenHash) return; // No UI flicker
+
+                let htmlStrAll = "";
                 data.data.forEach(t => {
-                    let tr = document.createElement('tr');
                     let timeStr = new Date(t.started * 1000).toLocaleTimeString();
-                    
-                    let breakdownHtml = `<details><summary style="cursor:pointer; color:#38bdf8;">View Breakdown</summary><div style="margin-top:8px; font-size:11px;">`;
+                    let isOpen = openDetails.has('det-' + t.turn_id) ? 'open' : '';
+                    let breakdownHtml = `<details id="det-${t.turn_id}" ontoggle="toggleDetails('det-${t.turn_id}', this.open)" ${isOpen}><summary style="cursor:pointer; color:#38bdf8;">View Breakdown</summary><div style="margin-top:8px; font-size:11px;">`;
                     t.subrequests.forEach(s => {
                         if(s.total_tokens > 0) {
                             breakdownHtml += `<div style="margin-bottom:4px;"><strong style="color:#c7d2fe;">${s.phase_type}</strong><br><span style="color:#94a3b8;">${s.prompt_tokens}p + ${s.completion_tokens}c = ${s.total_tokens}</span></div>`;
@@ -342,58 +328,39 @@
                     });
                     breakdownHtml += `</div></details>`;
                     
-                    tr.innerHTML = `
+                    htmlStrAll += `<tr>
                         <td style="font-size:12px; font-family:monospace;">${t.turn_id}</td>
                         <td style="font-size:12px;">${timeStr}</td>
                         <td>${t.prompt_tokens.toLocaleString()}</td>
                         <td>${t.completion_tokens.toLocaleString()}</td>
                         <td style="font-weight:bold; color:#38bdf8;">${t.total_tokens.toLocaleString()}</td>
                         <td>${breakdownHtml}</td>
-                    `;
-                    tBody.appendChild(tr);
+                    </tr>`;
                 });
+                tBody.innerHTML = htmlStrAll;
+                tBody.setAttribute('data-hash', currentTokenHash);
             } catch(e) { console.error("Token API error", e); }
         }
 
         function toggleTurn(id) {
             const el = document.getElementById(id);
-            if (el) el.classList.toggle('open');
+            if (el) { el.classList.toggle('open'); el.classList.contains('open') ? openTurns.add(id) : openTurns.delete(id); }
         }
-
-        function prevPage(tab) {
-            if (tab === 'traces' && tracePage > 1) { tracePage--; fetchLogs(); }
-            if (tab === 'tokens' && tokenPage > 1) { tokenPage--; fetchTokens(); }
-        }
-
-        function nextPage(tab) {
-            if (tab === 'traces') { tracePage++; fetchLogs(); }
-            if (tab === 'tokens') { tokenPage++; fetchTokens(); }
-        }
-
+        function toggleDetails(id, isOpen) { isOpen ? openDetails.add(id) : openDetails.delete(id); }
+        
+        function prevPage(tab) { if (tab === 'traces' && tracePage > 1) { tracePage--; fetchLogs(); } if (tab === 'tokens' && tokenPage > 1) { tokenPage--; fetchTokens(); } }
+        function nextPage(tab) { if (tab === 'traces') { tracePage++; fetchLogs(); } if (tab === 'tokens') { tokenPage++; fetchTokens(); } }
         function changePageSize(tab) {
             if (tab === 'traces') { tracePageSize = parseInt(document.getElementById('page-size-select').value); tracePage = 1; fetchLogs(); }
             if (tab === 'tokens') { tokenPageSize = parseInt(document.getElementById('token-page-size-select').value); tokenPage = 1; fetchTokens(); }
         }
 
-        async function setPolicy(p) {
-            await fetch('/api/policy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: p }) });
-            fetchQueueState();
-        }
-
-        async function resolve(id, action) {
-            await fetch(`/api/resolve/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action }) });
-            fetchQueueState();
-            fetchLogs();
-        }
+        async function setPolicy(p) { await fetch('/api/policy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: p }) }); fetchQueueState(); }
+        async function resolve(id, action) { await fetch(`/api/resolve/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action }) }); fetchQueueState(); fetchLogs(); }
 
         setInterval(fetchQueueState, 1500);
-        setInterval(() => {
-            if (currentTab === 'traces') fetchLogs();
-            if (currentTab === 'tokens') fetchTokens();
-        }, 5000);
-
-        fetchQueueState();
-        fetchLogs();
+        setInterval(() => { if (currentTab === 'traces') fetchLogs(); if (currentTab === 'tokens') fetchTokens(); }, 5000);
+        fetchQueueState(); fetchLogs();
     </script>
 </body>
 </html>
