@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import sqlite3
 import time
@@ -114,7 +115,7 @@ async def db_record_subrequest(subreq_id: str, turn_id: str, step_order: int, la
     await safe_db_write("INSERT OR REPLACE INTO turn_subrequests (id, turn_id, step_order, created_at, latency_ms, phase_type, is_external, target_engine, prompt, response, certainty, audit_notes, status, prompt_tokens, completion_tokens, total_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (subreq_id, turn_id, step_order, time.time(), latency_ms, phase_type, 1 if is_external else 0, target, prompt, response, certainty, audit_notes, status, prompt_tokens, completion_tokens, total_tokens))
 
 # ==========================================
-# In-Memory State
+# In-Memory State & Task Registry
 # ==========================================
 class GatePolicy(str, Enum):
     AUTO_APPROVE = "auto"
@@ -125,6 +126,7 @@ class AuditCertainty(str, Enum):
     HIGH_CERTAINTY_CLEAN = "high_certainty_clean"
     UNCERTAIN = "uncertain"
     FLAGGED_LEAK = "flagged_leak"
+    DECOY = "decoy"
 
 class ApprovalStatus(str, Enum):
     PENDING = "pending"
@@ -154,9 +156,11 @@ class ProxyState:
         self.force_delegate: bool = False
         self.auto_redact: bool = True
         self.enable_verifier: bool = True
+        self.enable_decoys: bool = True
         self.queue: Dict[str, QueueRecord] = {}
 
 state = ProxyState()
+active_turn_tasks: Dict[str, asyncio.Task] = {}  # Tracks active pipelines by turn_id
 
 # ==========================================
 # Transports & Helpers
@@ -194,7 +198,6 @@ async def stream_llm(base_url: str, api_key: str, model: str, messages: List[Dic
                         if "choices" in data and data["choices"]:
                             d = data["choices"][0].get("delta", {})
                             c, r = d.get("content", ""), d.get("reasoning_content", "")
-                            # Prevent reasoning models from emitting tags that prematurely close our OWUI wrapper
                             if c: c = c.replace("<think>", "").replace("</think>", "")
                             if r: r = r.replace("<think>", "").replace("</think>", "")
                             if c or r: yield c, r, None
@@ -204,9 +207,9 @@ async def stream_llm(base_url: str, api_key: str, model: str, messages: List[Dic
 
 async def evaluate_audit_certainty(abstract_prompt: str, turn_id: str, step_order: int) -> tuple[AuditCertainty, str, str]:
     sys_prompt = (
-        "You are an adversarial industrial espionage auditor. Judge if this text leaks proprietary identities or private company data.\n"
-        "CRITICAL DISTINCTION: Detailed architectural descriptions, complex mathematical formulas, and standard engineering terminology (e.g., 'autoregressive transformers', 'recurrent MLPs', 'halting gates') are absolutely SAFE and are NOT leaks. It is perfectly okay if the text describes a highly novel, specific, or experimental algorithm.\n"
-        "You must ONLY flag explicit proprietary identifiers, internal project names, company names, or explicit proprietary scale/model parameters (e.g., '4B Qwen', 'Project Chimera', 'AWS Cluster').\n"
+        "You are an adversarial industrial espionage auditor. Judge if this text leaks proprietary identities, confidential organization assets, or private project data.\n\n"
+        "CRITICAL DISTINCTION: Detailed formal descriptions, mathematical formulations, theoretical equations, and standard discipline-wide scientific/engineering terminology are completely SAFE and are NOT leaks. It is expected that the text describes novel, advanced, or experimental methodologies.\n\n"
+        "You must ONLY flag explicit proprietary identifiers: specific corporate/institution names, internal project codenames, private repository paths, confidential asset handles, or explicitly unnormalized production-scale metric constants.\n\n"
         "Respond STRICTLY in JSON format: {\"certainty\": \"high_certainty_clean\"|\"uncertain\"|\"flagged_leak\", \"notes\": \"...\"}"
     )
     op_id = str(uuid.uuid4())
@@ -256,7 +259,7 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
     await db_start_turn(turn_id, user_query)
     step = 1
     thinking_open = True
-    verifier_task = None  
+    active_subtasks: set[asyncio.Task] = set()
 
     yield format_sse("<think>\n=== 1. LOCAL TRIAGE ===\n")
 
@@ -267,10 +270,10 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             triage_sys = (
                 "You are an air-gapped scientific lead architect. The system policy strictly FORCES this request to be delegated to external solvers.\n"
                 "DO NOT attempt to solve the problem yourself. DO NOT output a DECISION or REASON. Your ONLY task is to anonymize the request.\n\n"
-                "CRITICAL ANONYMIZATION RULE:\n"
-                "STRIP ALL specific entity names, proprietary frameworks, explicit scale parameters (e.g., '4B', 'Qwen', 'AWS'), and internal project names. "
-                "HOWEVER, you MUST preserve the concrete scientific or engineering domain mechanics. Do not over-generalize into pure abstract math if the problem relies on specific deep learning, physics, or engineering principles. "
-                "Keep standard industry terminology (e.g., 'transformer', 'MLP', 'gradient flow', 'autoregressive model'). For example, replace '4B Qwen-style transformer' with 'a standard autoregressive transformer'.\n\n"
+                "CRITICAL ANONYMIZATION RULES:\n"
+                "1. STRIP ALL specific entity names, organization handles, proprietary codenames, and unnormalized production constants.\n"
+                "2. PRESERVE the core scientific, mathematical, physical, or algorithmic mechanics. Do not over-sanitize into vacuous generalities if the problem relies on concrete domain laws or formulations.\n"
+                "3. RETAIN canonical discipline-wide terminology and formal mathematical representations while using generic variable symbols and normalized dummy dimensions.\n\n"
                 "Format your output STRICTLY as:\n"
                 "===SOLVER_SPEC===\n[Emit ONLY the anonymized abstract problem statement. DO NOT solve it. Do NOT include intro labels.]"
                 f"{falsify_instruction}"
@@ -280,10 +283,10 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             triage_sys = (
                 "You are an air-gapped scientific lead architect. Analyze the user's query.\n"
                 "Determine if this request requires delegating a dense mathematical, structural, or algorithmic bottleneck to external solvers, or if it can be resolved locally.\n\n"
-                "CRITICAL ANONYMIZATION RULE FOR DELEGATION:\n"
-                "STRIP ALL specific entity names, proprietary frameworks, explicit scale parameters (e.g., '4B', 'Qwen', 'AWS'), and internal project names. "
-                "HOWEVER, you MUST preserve the concrete scientific or engineering domain mechanics. Do not over-generalize into pure abstract math if the problem relies on specific deep learning, physics, or engineering principles. "
-                "Keep standard industry terminology (e.g., 'transformer', 'MLP', 'gradient flow', 'autoregressive model'). For example, replace '4B Qwen-style transformer' with 'a standard autoregressive transformer'.\n\n"
+                "CRITICAL ANONYMIZATION RULES FOR DELEGATION:\n"
+                "1. STRIP ALL specific entity names, organization handles, proprietary codenames, and unnormalized production constants.\n"
+                "2. PRESERVE the core scientific, mathematical, physical, or algorithmic mechanics. Do not over-sanitize into vacuous generalities if the problem relies on concrete domain laws or formulations.\n"
+                "3. RETAIN canonical discipline-wide terminology and formal mathematical representations while using generic variable symbols and normalized dummy dimensions.\n\n"
                 "Format your decision STRICTLY as:\nDECISION: [LOCAL or DELEGATE]\nREASON: [Brief justification]\n\n"
                 "If DELEGATE, append:\n===SOLVER_SPEC===\n[Emit ONLY the anonymized abstract problem statement. DO NOT solve it. Do NOT include intro labels.]"
                 f"{falsify_instruction}"
@@ -351,7 +354,7 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                             break
                     else: break
             else:
-                yield format_sse("\n> Referee verification disabled. Proceeding with unverified local answer...\n")
+                yield format_sse("\n<think> Referee verification disabled. Proceeding with unverified local answer...</think>\n")
 
             if thinking_open: yield format_sse("\n</think>\n\n"); thinking_open = False
             await db_finish_turn(turn_id, "COMPLETED")
@@ -373,7 +376,7 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
 
             if state.enable_verifier and not falsification_spec:
                 yield format_sse("> Synthesizing missing declarative proposition...\n")
-                falsification_spec, f_lat, f_usg = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": "Extract the core mathematical invariant proposition. DO NOT use meta-labels."}, {"role": "user", "content": solver_spec}])
+                falsification_spec, f_lat, f_usg = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": "Extract the core formal, mathematical, or physical invariant proposition that must be satisfied. State it purely as a formal declarative condition without meta-labels or conversational filler."}, {"role": "user", "content": solver_spec}])
                 await db_record_subrequest(str(uuid.uuid4()), turn_id, step, f_lat, f"PROPOSITION_SYNTHESIS_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", solver_spec, falsification_spec, "N/A", "Synthesized missing invariant", "COMPLETED", f_usg.get("prompt_tokens", 0), f_usg.get("completion_tokens", 0), f_usg.get("total_tokens", 0))
                 step += 1
 
@@ -452,6 +455,10 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             if action_s == "feedback" or action_v == "feedback":
                 yield format_sse("\n> 🔄 User submitted manual rewrite feedback. Regenerating specs...\n")
                 active_feed = feed_s if action_s == "feedback" else feed_v
+                
+                feedback_step_id = str(uuid.uuid4())
+                await db_record_subrequest(feedback_step_id, turn_id, step, 0.0, f"MANUAL_REWRITE_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", active_feed, "[Rewriting...]", "N/A", "Applying user feedback", "IN_PROGRESS")
+                
                 manual_prompt = (
                     "You are a strict data privacy redaction agent. The user requested manual revisions to your specifications.\n\n"
                     f"PREVIOUS SOLVER_SPEC:\n{solver_spec}\n"
@@ -464,6 +471,8 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(triage_sys, conversation_history, manual_prompt)):
                     if c_reasoning: yield format_sse(c_reasoning)
                     if c_content: redacted_raw += c_content; yield format_sse(c_content)
+                    if finish_data:
+                        await db_record_subrequest(feedback_step_id, turn_id, step, finish_data[0], f"MANUAL_REWRITE_R{correction_round}", False, f"Local ({LOCAL_MODEL_NAME})", active_feed, redacted_raw, "N/A", "Feedback applied", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
                 step += 1
                 
                 rev_solver, rev_falsify = extract_specs(redacted_raw)
@@ -477,6 +486,40 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             if state.enable_verifier: falsification_spec = text_v
             spec_approved = True
 
+        # --- DECOY CHAFF CONCURRENT DISPATCH ---
+        if state.enable_decoys:
+            yield format_sse("> 🎭 Synthesizing and dispatching dynamic orthogonal decoy...\n")
+            
+            synth_id = str(uuid.uuid4())
+            disp_id = str(uuid.uuid4())
+            await db_record_subrequest(synth_id, turn_id, step, 0.0, "DECOY_SYNTHESIS", False, f"Local ({LOCAL_MODEL_NAME})", f"Synthesize decoy avoiding domain: {user_query[:50]}...", "[Synthesizing...]", "decoy", "Synthesis started", "IN_PROGRESS")
+            await db_record_subrequest(disp_id, turn_id, step + 1, 0.0, "DECOY_DISPATCH", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", "[Pending Synthesis...]", "[Waiting...]", "decoy", "Dispatch pending", "PENDING")
+
+            async def dispatch_decoy(step_idx, s_id, d_id):
+                try:
+                    chaff_sys = (
+                        "You are an automated technical decoy generator. Generate ONE highly technical, self-contained mathematical, algorithmic, or physics query.\n"
+                        "CRITICAL RULE: It MUST be completely ORTHOGONAL (unrelated) to the user's actual domain provided below.\n"
+                        "Make it graduate-level rigor. Output ONLY the query text. No conversational introductions or markdown formatting."
+                    )
+                    decoy_prompt, lat_s, usg_s = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": chaff_sys}, {"role": "user", "content": f"USER REAL DOMAIN TO AVOID: {user_query}"}])
+                    await db_record_subrequest(s_id, turn_id, step_idx, lat_s, "DECOY_SYNTHESIS", False, f"Local ({LOCAL_MODEL_NAME})", f"Avoid domain: {user_query[:50]}...", decoy_prompt, "decoy", "Synthesized dynamic decoy", "COMPLETED", usg_s.get("prompt_tokens",0), usg_s.get("completion_tokens",0), usg_s.get("total_tokens",0))
+                    
+                    await db_record_subrequest(d_id, turn_id, step_idx + 1, 0.0, "DECOY_DISPATCH", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", decoy_prompt, "[Executing...]", "decoy", "Decoy dispatched", "IN_PROGRESS")
+                    
+                    ans, lat_d, usg_d = await call_llm(PROVIDER1_API_BASE, PROVIDER1_API_KEY, PROVIDER1_MODEL_NAME, [{"role": "user", "content": decoy_prompt}], max_tokens=350)
+                    await db_record_subrequest(d_id, turn_id, step_idx + 1, lat_d, "DECOY_DISPATCH", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", decoy_prompt, ans[:400] + "...", "decoy", "Decoy completed", "COMPLETED", usg_d.get("prompt_tokens",0), usg_d.get("completion_tokens",0), usg_d.get("total_tokens",0))
+                except asyncio.CancelledError:
+                    await db_record_subrequest(s_id, turn_id, step_idx, 0.0, "DECOY_SYNTHESIS", False, "System", "Decoy synthesis", "[Aborted]", "decoy", "Cancelled", "CANCELLED")
+                    await db_record_subrequest(d_id, turn_id, step_idx + 1, 0.0, "DECOY_DISPATCH", True, "System", "Decoy dispatch", "[Aborted]", "decoy", "Cancelled", "CANCELLED")
+                    raise
+                except Exception as e:
+                    await db_record_subrequest(d_id, turn_id, step_idx + 1, 0.0, "DECOY_DISPATCH", True, "System", "Decoy", f"[Error: {str(e)}]", "decoy", "Error", "FAILED")
+
+            decoy_task = asyncio.create_task(dispatch_decoy(step, synth_id, disp_id))
+            active_subtasks.add(decoy_task)
+            step += 2 
+
         # --- EXECUTION STAGE ---
         yield format_sse("> Dispatched to External Solvers...\n")
         yield format_sse(f"\n--- SOLVER DERIVATION (Provider 1) ---\n")
@@ -485,7 +528,8 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
         solver_step_id = str(uuid.uuid4())
         await db_record_subrequest(solver_step_id, turn_id, step, 0.0, f"EXTERNAL_SOLVER_R{correction_round}", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", solver_spec, "[Streaming...]", s_cert.value, "Derivation started", "IN_PROGRESS")
         
-        async for c_content, c_reasoning, finish_data in stream_llm(PROVIDER1_API_BASE, PROVIDER1_API_KEY, PROVIDER1_MODEL_NAME, [{"role": "user", "content": solver_spec}]):
+        solver_gen = stream_llm(PROVIDER1_API_BASE, PROVIDER1_API_KEY, PROVIDER1_MODEL_NAME, [{"role": "user", "content": solver_spec}])
+        async for c_content, c_reasoning, finish_data in solver_gen:
             if c_reasoning: yield format_sse(c_reasoning)
             if c_content: final_solver_res += c_content; yield format_sse(c_content)
             if finish_data: await db_record_subrequest(solver_step_id, turn_id, step, finish_data[0], f"EXTERNAL_SOLVER_R{correction_round}", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", solver_spec, final_solver_res, s_cert.value, "Derivation completed", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
@@ -503,14 +547,15 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 return ans
 
             verifier_task = asyncio.create_task(run_verifier(step))
+            active_subtasks.add(verifier_task)
             final_verifier_res = await verifier_task
-            verifier_task = None
+            active_subtasks.discard(verifier_task)
             step += 1
 
             yield format_sse(f"\n--- REFEREE VERDICT ---\n{final_verifier_res}\n")
 
             if "VERDICT: FALSIFIED" in final_verifier_res:
-                yield format_sse("\n⚠️ Boundary Warning: Derivation Falsified by Referee. External loop ends.\n")
+                yield format_sse("\n⚠️️ Boundary Warning: Derivation Falsified by Referee. External loop ends.\n")
         else:
             final_verifier_res = "Referee verification is disabled by user policy."
             yield format_sse(f"\n\n--- REFEREE VERDICT ---\n{final_verifier_res}\n")
@@ -526,20 +571,34 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 final_res += c_content; yield format_sse(c_content)
             if finish_data: await db_record_subrequest(str(uuid.uuid4()), turn_id, step, finish_data[0], "LOCAL_ASSEMBLY", False, f"Local ({LOCAL_MODEL_NAME})", "Assembly Payload", final_res, "N/A", "Context reintegration", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
 
+        # Await pending background subtasks like decoy dispatch before concluding
+        if active_subtasks:
+            await asyncio.gather(*active_subtasks, return_exceptions=True)
+
         if thinking_open: yield format_sse("\n</think>\n\n"); thinking_open = False
         await db_finish_turn(turn_id, "COMPLETED")
         return
 
     except asyncio.CancelledError:
-        if verifier_task and not verifier_task.done(): verifier_task.cancel()
+        for t in list(active_subtasks):
+            if not t.done(): t.cancel()
+        async with state_lock:
+            for q_id, q_rec in list(state.queue.items()):
+                if q_rec.turn_id == turn_id:
+                    state.queue.pop(q_id, None)
         await db_finish_turn(turn_id, "CANCELLED_BY_USER")
         raise
     except BaseException as e:
+        for t in list(active_subtasks):
+            if not t.done(): t.cancel()
         err_trace = traceback.format_exc()
         await db_finish_turn(turn_id, f"FAILED: {str(e)}")
         if thinking_open: yield format_sse(f"\n\n=== PIPELINE ERROR ===\n{err_trace}\n</think>\n\n")
         else: yield format_sse(f"\n\n❌ **Pipeline Error:**\n```\n{err_trace}\n```\n")
         raise e
+    finally:
+        for t in list(active_subtasks):
+            if not t.done(): t.cancel()
 
 # ==========================================
 # FastAPI Endpoints
@@ -563,30 +622,54 @@ async def chat_completions(request: Request):
     if not user_query: raise HTTPException(status_code=400, detail="No user message provided.")
 
     turn_id = str(uuid.uuid4())
-    q = asyncio.Queue()
+    # Backpressure limit prevents producer runaways if client drops
+    q = asyncio.Queue(maxsize=20)
 
     async def producer():
         try:
             async for chunk in run_adaptive_pipeline(turn_id, user_query, messages[:-1]): await q.put(chunk)
             await q.put(None)
-        except asyncio.CancelledError: pass
+        except asyncio.CancelledError:
+            await q.put(None)
+            raise
         except Exception as e:
             await q.put(format_sse(f"\n\n<think>\n=== PIPELINE ERROR ===\n{traceback.format_exc()}\n</think>\n\n"))
             await q.put(None)
 
+    prod_task = asyncio.create_task(producer())
+    active_turn_tasks[turn_id] = prod_task
+
+    async def monitor_disconnect():
+        try:
+            while not prod_task.done():
+                if await request.is_disconnected():
+                    prod_task.cancel()
+                    break
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError: pass
+
+    monitor_task = asyncio.create_task(monitor_disconnect())
+
     async def consumer():
-        prod_task = asyncio.create_task(producer())
         is_cancelled = False
         try:
             while True:
                 try:
-                    chunk = await asyncio.wait_for(q.get(), timeout=3.0)
+                    chunk = await asyncio.wait_for(q.get(), timeout=1.0)
                     if chunk is None: break
                     yield chunk
-                except asyncio.TimeoutError: yield ": keepalive\n\n"
-        except asyncio.CancelledError:
-            is_cancelled = True; raise
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        prod_task.cancel()
+                        break
+                    yield ": keepalive\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            is_cancelled = True
+            prod_task.cancel()
+            raise
         finally:
+            active_turn_tasks.pop(turn_id, None)
+            monitor_task.cancel()
             if not prod_task.done():
                 prod_task.cancel()
                 try: await prod_task
@@ -604,13 +687,36 @@ async def chat_completions(request: Request):
 
     return StreamingResponse(consumer(), media_type="text/event-stream")
 
+@app.post("/api/cancel/{turn_id}")
+async def api_cancel_turn(turn_id: str):
+    task = active_turn_tasks.get(turn_id)
+    if task and not task.done():
+        task.cancel()
+    
+    async with state_lock:
+        for q_id, q_rec in list(state.queue.items()):
+            if q_rec.turn_id == turn_id:
+                q_rec.status = ApprovalStatus.REJECTED
+                q_rec.event.set()
+                
+    await db_finish_turn(turn_id, "CANCELLED_BY_USER")
+    return {"status": "cancelled", "turn_id": turn_id}
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def get_dashboard():
     with open("dashboard.html", "r", encoding="utf-8") as f: return HTMLResponse(content=f.read())
 
 @app.get("/api/state")
 async def get_api_state():
-    async with state_lock: return {"policy": state.policy.value, "force_delegate": state.force_delegate, "auto_redact": state.auto_redact, "enable_verifier": state.enable_verifier, "queue": [r.model_dump() for r in state.queue.values()]}
+    async with state_lock: 
+        return {
+            "policy": state.policy.value, 
+            "force_delegate": state.force_delegate, 
+            "auto_redact": state.auto_redact, 
+            "enable_verifier": state.enable_verifier, 
+            "enable_decoys": state.enable_decoys,
+            "queue": [r.model_dump() for r in state.queue.values()]
+        }
 
 @app.get("/api/logs")
 async def get_paginated_logs(page: int = 1, page_size: int = 10):
@@ -655,6 +761,7 @@ async def update_routing(payload: Dict[str, Any]):
         if "force_delegate" in payload: state.force_delegate = payload["force_delegate"]
         if "auto_redact" in payload: state.auto_redact = payload["auto_redact"]
         if "enable_verifier" in payload: state.enable_verifier = payload["enable_verifier"]
+        if "enable_decoys" in payload: state.enable_decoys = payload["enable_decoys"]
     return {"status": "ok"}
 
 @app.post("/api/edit/{req_id}")
