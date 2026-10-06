@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Privacy Oracle - Security Gate</title>
+    <title>BorrowModel</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
@@ -47,7 +47,7 @@
         .btn-feedback { background: #ca8a04; } .btn-feedback:hover { background: #a16207; }
         .btn-cancel-mini { background: #dc2626; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 12px; }
         .btn-cancel-mini:hover { background: #b91c1c; }
-        .btn-edit { background: #0284c7; width: auto; font-size: 11px; padding: 4px 8px; margin-top: 8px; } .btn-edit:hover { background: #0369a1; }
+        .btn-edit { background: #0284c7; width: auto; font-size:11px; padding: 4px 8px; cursor: pointer; color: white; border: none; border-radius: 4px; font-weight: bold; } .btn-edit:hover { background: #0369a1; }
         .btn-copy { position: absolute; right: 4px; top: 4px; font-size: 10px; padding: 2px 6px; background: #334155; color: #fff; border: 1px solid #475569; border-radius: 4px; cursor: pointer; z-index: 10; }
         .sub-meta { color: #94a3b8; font-size: 11px; margin-top: 4px; }
         
@@ -73,7 +73,7 @@
         .pager-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         select.page-select { background: #334155; color: #fff; border: 1px solid #475569; padding: 6px 10px; border-radius: 4px; }
         
-        textarea.edit-area { width: 100%; box-sizing: border-box; background: #0f172a; color: #f8fafc; border: 1px solid #38bdf8; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 12px; resize: vertical; }
+        textarea.edit-area { width: 100%; box-sizing: border-box; background: #0f172a; color: #f8fafc; border: 1px solid #38bdf8; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 12px; resize: vertical; margin-bottom: 8px;}
     </style>
 </head>
 <body>
@@ -225,8 +225,8 @@
             td.innerHTML = `
                 <textarea id="edit-area-${id}" class="edit-area" style="height:150px;">${escapeHtml(preEl.innerText)}</textarea>
                 <div style="margin-top:8px; display:flex; gap:8px;">
-                    <button class="btn-action btn-approve" onclick="saveEdit('${id}')" style="margin-bottom:0; width:auto;">Save Edit</button>
-                    <button class="btn-action btn-reject" onclick="cancelEdit('${id}')" style="margin-bottom:0; width:auto;">Cancel</button>
+                    <button class="btn-action btn-approve" style="width:auto; margin-bottom:0;" onclick="saveEdit('${id}')">Save Edit</button>
+                    <button class="btn-action btn-reject" style="width:auto; margin-bottom:0;" onclick="cancelEdit('${id}')">Cancel</button>
                 </div>
             `;
         }
@@ -239,6 +239,26 @@
         }
 
         function cancelEdit(id) { activeEdits.delete(id); fetchQueueState(); }
+
+        function showRegenModal(turnId, subId) {
+            const preEl = document.getElementById(`p-${subId}`);
+            const td = document.getElementById(`regen-wrapper-${subId}`);
+            if(td) {
+                td.style.display = 'block';
+                document.getElementById(`regen-text-${subId}`).value = preEl.innerText;
+            }
+        }
+
+        async function submitRegen(turnId, subId) {
+            const prompt = document.getElementById(`regen-text-${subId}`).value;
+            await fetch(`/api/assembly/regenerate/${turnId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ prompt: prompt })
+            });
+            document.getElementById(`regen-wrapper-${subId}`).style.display = 'none';
+            fetchLogs();
+        }
 
         async function fetchQueueState() {
             if (currentTab !== 'traces' || pauseQueue || activeEdits.size > 0) return;
@@ -284,7 +304,7 @@
                                     <button class="btn-copy" onclick="copyText(this, 'q-pre-${item.id}')">📋 Copy</button>
                                     <pre id="q-pre-${item.id}">${escapeHtml(item.prompt_text)}</pre>
                                 </div>
-                                <button class="btn-action btn-edit" onclick="editRequest('${item.id}')">✏️ Quick-Edit Payload Before Sending</button>
+                                <button class="btn-action btn-edit" onclick="editRequest('${item.id}')" style="margin-top:8px;">✏️ Quick-Edit Payload Before Sending</button>
                             </td>
                             <td>
                                 <div class="evaluator-box">
@@ -362,18 +382,33 @@
                         let certBadge = sub.certainty !== 'N/A' ? `<span class="badge ${sub.certainty === 'high_certainty_clean' ? 'badge-clean' : (sub.certainty === 'decoy' ? 'badge-decoy' : 'badge-uncertain')}">${sub.certainty}</span>` : '';
                         let tokStr = sub.total_tokens > 0 ? `<span class="token-pill">${sub.prompt_tokens}↓ + ${sub.completion_tokens}↑ = ${sub.total_tokens}</span>` : "";
 
+                        const regenBtn = (sub.phase_type === 'LOCAL_ASSEMBLY' || sub.phase_type === 'LOCAL_ASSEMBLY_REGEN') ? `<button class="btn-edit" onclick="showRegenModal('${turn.turn_id}', '${sub.id}')" style="margin-left:8px;">🔄 Regenerate Output</button>` : '';
+
                         htmlStrAll += `
                             <div class="timeline-step ${isDecoy ? 'decoy-node' : (isExt ? '' : 'local-node')}">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
                                     <div><span class="badge ${badgeType}">Step ${sub.step_order}: ${sub.phase_type}</span><span style="font-size:12px; color:#94a3b8; margin-left:6px;">➔ ${escapeHtml(sub.target_engine)}</span></div>
                                     <div style="font-size:11px; color:#64748b; display:flex; align-items:center;">
                                         ${tokStr} Latency: ${sub.latency_ms > 0 ? sub.latency_ms + 'ms' : 'Gating'} | Status: <strong style="margin-left:4px;">${sub.status}</strong>
+                                        ${regenBtn}
                                     </div>
                                 </div>
                                 <table>
                                     <tr><th style="width:50%;">Inbound Prompt Payload</th><th style="width:50%;">Response / Diagnosis</th></tr>
                                     <tr>
-                                        <td><div style="position:relative;"><button class="btn-copy" onclick="copyText(this, 'p-${sub.id}')">📋 Copy</button><pre id="p-${sub.id}">${escapeHtml(sub.prompt)}</pre></div></td>
+                                        <td>
+                                            <div style="position:relative;">
+                                                <button class="btn-copy" onclick="copyText(this, 'p-${sub.id}')">📋 Copy</button>
+                                                <pre id="p-${sub.id}">${escapeHtml(sub.prompt)}</pre>
+                                            </div>
+                                            <div id="regen-wrapper-${sub.id}" style="display:none; margin-top:8px;">
+                                                <textarea id="regen-text-${sub.id}" class="edit-area"></textarea>
+                                                <div style="display:flex; gap:8px; margin-top:6px;">
+                                                    <button class="btn-action btn-approve" style="width:auto; margin-bottom:0;" onclick="submitRegen('${turn.turn_id}', '${sub.id}')">Submit Regeneration</button>
+                                                    <button class="btn-action btn-reject" style="width:auto; margin-bottom:0;" onclick="document.getElementById('regen-wrapper-${sub.id}').style.display='none'">Cancel</button>
+                                                </div>
+                                            </div>
+                                        </td>
                                         <td>
                                             ${sub.response ? `<div style="position:relative;"><button class="btn-copy" onclick="copyText(this, 'r-${sub.id}')">📋 Copy</button><pre id="r-${sub.id}">${escapeHtml(sub.response)}</pre></div>` : '<em style="color:#64748b;">(No response payload)</em>'}
                                             ${sub.audit_notes ? `<div class="sub-meta" style="margin-top:6px;">${certBadge} <strong>Audit:</strong>${escapeHtml(sub.audit_notes)}</div>` : ''}

@@ -9,6 +9,7 @@ import uuid
 import traceback
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -161,6 +162,7 @@ class ProxyState:
 
 state = ProxyState()
 active_turn_tasks: Dict[str, asyncio.Task] = {}  
+turn_background_tasks: Dict[str, set[asyncio.Task]] = defaultdict(set)
 
 # ==========================================
 # Transports & Helpers
@@ -212,7 +214,7 @@ async def stream_llm(base_url: str, api_key: str, model: str, messages: List[Dic
 
 async def evaluate_audit_certainty(abstract_prompt: str, turn_id: str, step_order: int) -> tuple[AuditCertainty, str, str]:
     sys_prompt = (
-        "You are an adversarial industrial espionage auditor. Judge if this text leaks proprietary identities, confidential organization assets, or private project data.\n\n"
+        "You are an adversarial industrial espionage auditor. DO NOT attempt to solve the provided problem yourself. Judge if this text leaks proprietary identities, confidential organization assets, or private project data.\n\n"
         "CRITICAL DISTINCTION: Detailed formal descriptions, mathematical formulations, theoretical equations, and standard discipline-wide scientific/engineering terminology are completely SAFE and are NOT leaks. It is expected that the text describes novel, advanced, or experimental methodologies.\n\n"
         "You must ONLY flag explicit proprietary identifiers: specific corporate/institution names, internal project codenames, private repository paths, confidential asset handles, or explicitly unnormalized production-scale metric constants.\n\n"
         "Respond STRICTLY in JSON format: {\"certainty\": \"high_certainty_clean\"|\"uncertain\"|\"flagged_leak\", \"notes\": \"...\"}"
@@ -264,7 +266,7 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
     await db_start_turn(turn_id, user_query)
     step = 1
     thinking_open = True
-    active_subtasks: set[asyncio.Task] = set()
+    local_subtasks: set[asyncio.Task] = set()
 
     yield format_sse("<think>\n=== 1. LOCAL TRIAGE ===\n")
 
@@ -371,29 +373,63 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
         await db_update_turn_mode(turn_id, "HYBRID_EGRESS")
         yield format_sse("\n\n=== 2. ROUTING: HYBRID EGRESS DELEGATION ===\n")
 
-        # --- BACKGROUND DECOY SYNTHESIS ---
-        decoy_synthesis_task = None
-        synth_step_id = str(uuid.uuid4())
-        disp_step_id = str(uuid.uuid4())
+        # --- BACKGROUND DECOY SYNTHESIS & DISPATCH ---
+        # Decoys are launched in background tasks completely detached from the main request's termination condition.
         decoy_base_step = step
         
         if state.enable_decoys:
             yield format_sse("> 🎭 Background synthesis of orthogonal decoy started...\n")
-            await db_record_subrequest(synth_step_id, turn_id, decoy_base_step, 0.0, "DECOY_SYNTHESIS", False, f"Local ({LOCAL_MODEL_NAME})", f"Avoid domain: {user_query[:50]}...", "[Synthesizing...]", "decoy", "Synthesis started", "IN_PROGRESS")
+            synth_step_id = str(uuid.uuid4())
+            disp_step_id = str(uuid.uuid4())
             
-            async def synthesize():
-                chaff_sys = (
-                    "You are an automated technical decoy generator. Generate ONE highly technical, self-contained mathematical, algorithmic, or physics query.\n"
-                    "CRITICAL RULE: It MUST be completely ORTHOGONAL (unrelated) to the user's actual domain provided below.\n"
-                    "Make it graduate-level rigor. Output ONLY the query text. No conversational introductions or markdown formatting."
-                )
-                raw, lat, usg = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": chaff_sys}, {"role": "user", "content": f"USER REAL DOMAIN TO AVOID: {user_query}"}])
-                clean = re.sub(r"<think>.*?(</think>|$)", "", raw, flags=re.DOTALL | re.IGNORECASE).strip()
-                return clean, lat, usg
+            async def run_decoy_flow(step_idx, s_id, d_id):
+                try:
+                    await db_record_subrequest(s_id, turn_id, step_idx, 0.0, "DECOY_SYNTHESIS", False, f"Local ({LOCAL_MODEL_NAME})", f"Avoid domain: {user_query[:50]}...", "[Synthesizing...]", "decoy", "Synthesis started", "IN_PROGRESS")
+                    
+                    chaff_sys = (
+                        "You are an automated technical decoy generator. DO NOT attempt to solve the provided problem yourself. Generate ONE highly technical, self-contained mathematical, algorithmic, or physics query.\n"
+                        "CRITICAL RULE: It MUST be completely ORTHOGONAL (unrelated) to the user's actual domain provided below.\n"
+                        "Make it graduate-level rigor. Output ONLY the query text. No conversational introductions or markdown formatting."
+                    )
+                    raw, lat_s, usg_s = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "system", "content": chaff_sys}, {"role": "user", "content": f"USER REAL DOMAIN TO AVOID: {user_query}"}])
+                    decoy_prompt = re.sub(r"<think>.*?(</think>|$)", "", raw, flags=re.DOTALL | re.IGNORECASE).strip()
+                    
+                    await db_record_subrequest(s_id, turn_id, step_idx, lat_s, "DECOY_SYNTHESIS", False, f"Local ({LOCAL_MODEL_NAME})", f"Avoid domain: {user_query[:50]}...", decoy_prompt, "decoy", "Synthesized dynamic decoy", "COMPLETED", usg_s.get("prompt_tokens",0), usg_s.get("completion_tokens",0), usg_s.get("total_tokens",0))
+                    
+                    if not decoy_prompt: raise ValueError("Empty decoy prompt synthesized.")
+                    
+                    # Queue decoy for approval
+                    rec_decoy = QueueRecord(
+                        id=str(uuid.uuid4()), turn_id=turn_id, round_idx=1,
+                        created_at=time.time(), target_provider=f"Provider 1 ({PROVIDER1_MODEL_NAME})",
+                        spec_type="decoy", prompt_text=decoy_prompt, certainty=AuditCertainty.DECOY,
+                        audit_notes="Orthogonal decoy query synthesized. Safe for dispatch."
+                    )
+                    action, text_d, _ = await queue_and_await_approval(rec_decoy, step_idx + 1)
+                    
+                    if action == "reject":
+                        await db_record_subrequest(d_id, turn_id, step_idx + 2, 0.0, "DECOY_DISPATCH", True, "System", text_d, "[Rejected by User Gate]", "decoy", "Cancelled", "CANCELLED")
+                        return
+                        
+                    await db_record_subrequest(d_id, turn_id, step_idx + 2, 0.0, "DECOY_DISPATCH", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", text_d, "[Executing...]", "decoy", "Decoy dispatched", "IN_PROGRESS")
+                    
+                    ans, lat_d, usg_d = await call_llm(PROVIDER1_API_BASE, PROVIDER1_API_KEY, PROVIDER1_MODEL_NAME, [{"role": "user", "content": text_d}], max_tokens=350)
+                    ans_clean = re.sub(r"<think>.*?(</think>|$)", "", ans, flags=re.DOTALL | re.IGNORECASE).strip()
+                    
+                    await db_record_subrequest(d_id, turn_id, step_idx + 2, lat_d, "DECOY_DISPATCH", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", text_d, ans_clean[:400] + "...", "decoy", "Decoy completed", "COMPLETED", usg_d.get("prompt_tokens",0), usg_d.get("completion_tokens",0), usg_d.get("total_tokens",0))
                 
-            decoy_synthesis_task = asyncio.create_task(synthesize())
-            active_subtasks.add(decoy_synthesis_task)
-            step += 2 
+                except asyncio.CancelledError:
+                    await db_record_subrequest(s_id, turn_id, step_idx, 0.0, "DECOY_SYNTHESIS", False, "System", "Decoy synthesis", "[Aborted]", "decoy", "Cancelled", "CANCELLED")
+                    await db_record_subrequest(d_id, turn_id, step_idx + 2, 0.0, "DECOY_DISPATCH", True, "System", "Decoy dispatch", "[Aborted]", "decoy", "Cancelled", "CANCELLED")
+                    raise
+                except Exception as e:
+                    prompt_log = decoy_prompt if 'decoy_prompt' in locals() else "[Synthesis Failed]"
+                    await db_record_subrequest(d_id, turn_id, step_idx + 2, 0.0, "DECOY_DISPATCH", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", prompt_log, f"[Error: {str(e)}]", "decoy", "Error", "FAILED")
+
+            decoy_bg_task = asyncio.create_task(run_decoy_flow(decoy_base_step, synth_step_id, disp_step_id))
+            turn_background_tasks[turn_id].add(decoy_bg_task)
+            decoy_bg_task.add_done_callback(lambda t: turn_background_tasks[turn_id].discard(t))
+            step += 3 
 
         correction_round = 0
         spec_approved = False
@@ -515,33 +551,6 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
             if state.enable_verifier: falsification_spec = text_v
             spec_approved = True
 
-        # --- DECOY CHAFF CONCURRENT DISPATCH ---
-        if state.enable_decoys and decoy_synthesis_task:
-            async def finish_decoy():
-                try:
-                    decoy_prompt, lat_s, usg_s = await decoy_synthesis_task
-                    await db_record_subrequest(synth_step_id, turn_id, decoy_base_step, lat_s, "DECOY_SYNTHESIS", False, f"Local ({LOCAL_MODEL_NAME})", f"Avoid domain: {user_query[:50]}...", decoy_prompt, "decoy", "Synthesized dynamic decoy", "COMPLETED", usg_s.get("prompt_tokens",0), usg_s.get("completion_tokens",0), usg_s.get("total_tokens",0))
-                    
-                    if not decoy_prompt:
-                        raise ValueError("Empty decoy prompt synthesized.")
-                        
-                    await db_record_subrequest(disp_step_id, turn_id, decoy_base_step + 1, 0.0, "DECOY_DISPATCH", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", decoy_prompt, "[Executing...]", "decoy", "Decoy dispatched", "IN_PROGRESS")
-                    
-                    ans, lat_d, usg_d = await call_llm(PROVIDER1_API_BASE, PROVIDER1_API_KEY, PROVIDER1_MODEL_NAME, [{"role": "user", "content": decoy_prompt}], max_tokens=350)
-                    ans_clean = re.sub(r"<think>.*?(</think>|$)", "", ans, flags=re.DOTALL | re.IGNORECASE).strip()
-                    
-                    await db_record_subrequest(disp_step_id, turn_id, decoy_base_step + 1, lat_d, "DECOY_DISPATCH", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", decoy_prompt, ans_clean[:400] + "...", "decoy", "Decoy completed", "COMPLETED", usg_d.get("prompt_tokens",0), usg_d.get("completion_tokens",0), usg_d.get("total_tokens",0))
-                except asyncio.CancelledError:
-                    await db_record_subrequest(synth_step_id, turn_id, decoy_base_step, 0.0, "DECOY_SYNTHESIS", False, "System", "Decoy synthesis", "[Aborted]", "decoy", "Cancelled", "CANCELLED")
-                    await db_record_subrequest(disp_step_id, turn_id, decoy_base_step + 1, 0.0, "DECOY_DISPATCH", True, "System", "Decoy dispatch", "[Aborted]", "decoy", "Cancelled", "CANCELLED")
-                    raise
-                except Exception as e:
-                    prompt_log = decoy_prompt if 'decoy_prompt' in locals() else "[Synthesis Failed]"
-                    await db_record_subrequest(disp_step_id, turn_id, decoy_base_step + 1, 0.0, "DECOY_DISPATCH", True, f"Provider 1 ({PROVIDER1_MODEL_NAME})", prompt_log, f"[Error: {str(e)}]", "decoy", "Error", "FAILED")
-
-            decoy_dispatch_task = asyncio.create_task(finish_decoy())
-            active_subtasks.add(decoy_dispatch_task)
-
         # --- EXECUTION STAGE ---
         yield format_sse("> Dispatched to External Solvers...\n")
         yield format_sse(f"\n--- SOLVER DERIVATION (Provider 1) ---\n")
@@ -569,39 +578,38 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
                 return ans
 
             verifier_task = asyncio.create_task(run_verifier(step))
-            active_subtasks.add(verifier_task)
+            local_subtasks.add(verifier_task)
             final_verifier_res = await verifier_task
-            active_subtasks.discard(verifier_task)
+            local_subtasks.discard(verifier_task)
             step += 1
 
             yield format_sse(f"\n--- REFEREE VERDICT ---\n{final_verifier_res}\n")
 
             if "VERDICT: FALSIFIED" in final_verifier_res:
-                yield format_sse("\n⚠️️ Boundary Warning: Derivation Falsified by Referee. External loop ends.\n")
+                yield format_sse("\n⚠️ Boundary Warning: Derivation Falsified by Referee. External loop ends.\n")
         else:
             final_verifier_res = "Referee verification is disabled by user policy."
-            yield format_sse(f"\n\n--- REFEREE VERDICT ---\n{final_verifier_res}\n")
+            yield format_sse(f"\n<think> Referee verification disabled. Proceeding with unverified local answer...</think>\n")
 
         yield format_sse("\n=== 3. FINAL INTEGRATION ===\nSynthesizing verified solution...\n")
         assemble_sys = "You are the local integration architect. Synthesize the user's request, external derivation, and referee report into a cohesive, verified final answer. Acknowledge boundary limitations if refuted."
         
         final_res = ""
-        async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(assemble_sys, conversation_history, f"ORIGINAL QUERY:\n{user_query}\n\nEXTERNAL DERIVATION:\n{final_solver_res}\n\nREFEREE REPORT:\n{final_verifier_res}")):
+        assemble_payload = f"ORIGINAL QUERY:\n{user_query}\n\nEXTERNAL DERIVATION:\n{final_solver_res}\n\nREFEREE REPORT:\n{final_verifier_res}"
+        
+        async for c_content, c_reasoning, finish_data in stream_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, build_payload(assemble_sys, conversation_history, assemble_payload)):
             if c_reasoning: yield format_sse(c_reasoning)
             if c_content:
                 if thinking_open: yield format_sse("\n</think>\n\n"); thinking_open = False
                 final_res += c_content; yield format_sse(c_content)
-            if finish_data: await db_record_subrequest(str(uuid.uuid4()), turn_id, step, finish_data[0], "LOCAL_ASSEMBLY", False, f"Local ({LOCAL_MODEL_NAME})", "Assembly Payload", final_res, "N/A", "Context reintegration", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
-
-        if active_subtasks:
-            await asyncio.gather(*active_subtasks, return_exceptions=True)
+            if finish_data: await db_record_subrequest(str(uuid.uuid4()), turn_id, step, finish_data[0], "LOCAL_ASSEMBLY", False, f"Local ({LOCAL_MODEL_NAME})", assemble_payload, final_res, "N/A", "Context reintegration", "COMPLETED", finish_data[1].get("prompt_tokens",0), finish_data[1].get("completion_tokens",0), finish_data[1].get("total_tokens",0))
 
         if thinking_open: yield format_sse("\n</think>\n\n"); thinking_open = False
         await db_finish_turn(turn_id, "COMPLETED")
         return
 
     except asyncio.CancelledError:
-        for t in list(active_subtasks):
+        for t in list(local_subtasks):
             if not t.done(): t.cancel()
         async with state_lock:
             for q_id, q_rec in list(state.queue.items()):
@@ -610,7 +618,7 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
         await db_finish_turn(turn_id, "CANCELLED_BY_USER")
         raise
     except BaseException as e:
-        for t in list(active_subtasks):
+        for t in list(local_subtasks):
             if not t.done(): t.cancel()
         err_trace = traceback.format_exc()
         await db_finish_turn(turn_id, f"FAILED: {str(e)}")
@@ -618,7 +626,7 @@ async def run_adaptive_pipeline(turn_id: str, user_query: str, conversation_hist
         else: yield format_sse(f"\n\n❌ **Pipeline Error:**\n```\n{err_trace}\n```\n")
         raise e
     finally:
-        for t in list(active_subtasks):
+        for t in list(local_subtasks):
             if not t.done(): t.cancel()
 
 # ==========================================
@@ -707,11 +715,32 @@ async def chat_completions(request: Request):
 
     return StreamingResponse(consumer(), media_type="text/event-stream")
 
+class RegenRequest(BaseModel):
+    prompt: str
+
+@app.post("/api/assembly/regenerate/{turn_id}")
+async def regenerate_assembly(turn_id: str, req: RegenRequest):
+    op_id = str(uuid.uuid4())
+    await db_record_subrequest(op_id, turn_id, 999, 0.0, "LOCAL_ASSEMBLY_REGEN", False, f"Local ({LOCAL_MODEL_NAME})", req.prompt, "[Executing...]", "N/A", "Regenerating assembly locally", "IN_PROGRESS")
+    try:
+        ans, lat, usg = await call_llm(LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL_NAME, [{"role": "user", "content": req.prompt}], max_tokens=None)
+        await db_record_subrequest(op_id, turn_id, 999, lat, "LOCAL_ASSEMBLY_REGEN", False, f"Local ({LOCAL_MODEL_NAME})", req.prompt, ans, "N/A", "Regenerated successfully", "COMPLETED", usg.get("prompt_tokens",0), usg.get("completion_tokens",0), usg.get("total_tokens",0))
+        return {"status": "ok", "response": ans}
+    except Exception as e:
+        await db_record_subrequest(op_id, turn_id, 999, 0.0, "LOCAL_ASSEMBLY_REGEN", False, "System", req.prompt, f"Failed: {str(e)}", "N/A", "Error", "FAILED")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/cancel/{turn_id}")
 async def api_cancel_turn(turn_id: str):
+    # Cancel the main generation pipeline
     task = active_turn_tasks.get(turn_id)
     if task and not task.done():
         task.cancel()
+        
+    # Cancel all independent background tasks attached to this turn (e.g., decoys)
+    if turn_id in turn_background_tasks:
+        for t in list(turn_background_tasks[turn_id]):
+            if not t.done(): t.cancel()
     
     async with state_lock:
         for q_id, q_rec in list(state.queue.items()):
