@@ -47,7 +47,7 @@
         .btn-feedback { background: #ca8a04; } .btn-feedback:hover { background: #a16207; }
         .btn-cancel-mini { background: #dc2626; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 12px; }
         .btn-cancel-mini:hover { background: #b91c1c; }
-        .btn-edit { background: #0284c7; width: auto; font-size:11px; padding: 4px 8px; cursor: pointer; color: white; border: none; border-radius: 4px; font-weight: bold; } .btn-edit:hover { background: #0369a1; }
+        .btn-edit { background: #0284c7; width: auto; font-size:11px; padding: 4px 8px; margin-top:8px; cursor: pointer; color: white; border: none; border-radius: 4px; font-weight: bold;} .btn-edit:hover{ background: #0369a1; }
         .btn-copy { position: absolute; right: 4px; top: 4px; font-size: 10px; padding: 2px 6px; background: #334155; color: #fff; border: 1px solid #475569; border-radius: 4px; cursor: pointer; z-index: 10; }
         .sub-meta { color: #94a3b8; font-size: 11px; margin-top: 4px; }
         
@@ -78,7 +78,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>BorrowModel Control Plane</h1>
+        <h1>BorrowModel Dashboard</h1>
         <div style="font-size: 13px; color: #94a3b8; margin-bottom: 10px;">
             Enclave Loopback: <strong>127.0.0.1:9908</strong> | Air-Gap Mode: <strong>Strict Dual-Vendor Verification</strong>
         </div>
@@ -90,6 +90,13 @@
 
         <div id="tab-traces" class="tab-content active">
             <div class="card" style="display: flex; gap: 30px; flex-wrap: wrap;">
+                <div>
+                    <h2>System Actions</h2>
+                    <div class="policy-group">
+                        <button class="policy-btn" onclick="clearCache()">🧹 Clear Fast-Forward Cache</button>
+                    </div>
+                    <p style="font-size: 11px; color: #94a3b8; margin-top: 6px;">Forces full egress regen on next query.</p>
+                </div>
                 <div>
                     <h2>Routing Strategy</h2>
                     <div class="policy-group">
@@ -121,10 +128,18 @@
                 <div>
                     <h2>Egress Gating Policy</h2>
                     <div class="policy-group">
-                        <button class="policy-btn" id="btn-manual" onclick="setPolicy('manual')">Manual-Approve All</button>
-                        <button class="policy-btn" id="btn-confidence" onclick="setPolicy('confidence')">Confidence-Based</button>
-                        <button class="policy-btn" id="btn-auto" onclick="setPolicy('auto')">Auto-Approve All</button>
+                        <button class="policy-btn" id="btn-manual" onclick="setPolicy('manual', 'egress')">Manual-Approve All</button>
+                        <button class="policy-btn" id="btn-confidence" onclick="setPolicy('confidence', 'egress')">Confidence-Based</button>
+                        <button class="policy-btn" id="btn-auto" onclick="setPolicy('auto', 'egress')">Auto-Approve All</button>
                     </div>
+                </div>
+                <div>
+                    <h2>Assembly Gating Policy</h2>
+                    <div class="policy-group">
+                        <button class="policy-btn" id="btn-asm-manual" onclick="setPolicy('manual', 'assembly')">Manual Review</button>
+                        <button class="policy-btn" id="btn-asm-auto" onclick="setPolicy('auto', 'assembly')">Auto-Approve</button>
+                    </div>
+                    <p style="font-size: 11px; color: #94a3b8; margin-top: 6px;">Pauses pipeline before local synthesis.</p>
                 </div>
             </div>
 
@@ -240,24 +255,9 @@
 
         function cancelEdit(id) { activeEdits.delete(id); fetchQueueState(); }
 
-        function showRegenModal(turnId, subId) {
-            const preEl = document.getElementById(`p-${subId}`);
-            const td = document.getElementById(`regen-wrapper-${subId}`);
-            if(td) {
-                td.style.display = 'block';
-                document.getElementById(`regen-text-${subId}`).value = preEl.innerText;
-            }
-        }
-
-        async function submitRegen(turnId, subId) {
-            const prompt = document.getElementById(`regen-text-${subId}`).value;
-            await fetch(`/api/assembly/regenerate/${turnId}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ prompt: prompt })
-            });
-            document.getElementById(`regen-wrapper-${subId}`).style.display = 'none';
-            fetchLogs();
+        async function clearCache() {
+            await fetch('/api/cache/clear', { method: 'POST' });
+            alert('Fast-Forward Cache Cleared! The next regeneration will perform a full external egress cycle.');
         }
 
         async function fetchQueueState() {
@@ -267,9 +267,13 @@
                 const data = await res.json();
                 
                 document.querySelectorAll('.policy-btn').forEach(btn => btn.classList.remove('active'));
+                
                 if (data.policy === 'auto') document.getElementById('btn-auto').classList.add('active');
                 if (data.policy === 'confidence') document.getElementById('btn-confidence').classList.add('active');
                 if (data.policy === 'manual') document.getElementById('btn-manual').classList.add('active');
+
+                if (data.assembly_policy === 'auto') document.getElementById('btn-asm-auto').classList.add('active');
+                if (data.assembly_policy === 'manual') document.getElementById('btn-asm-manual').classList.add('active');
 
                 if (data.force_delegate) { document.getElementById('btn-route-force').classList.add('active'); document.getElementById('btn-route-auto').classList.remove('active'); } 
                 else { document.getElementById('btn-route-auto').classList.add('active'); document.getElementById('btn-route-force').classList.remove('active'); }
@@ -288,7 +292,7 @@
                 if (data.queue.length === 0) {
                     qContainer.innerHTML = "<p style='color:#94a3b8;'>No pending requests awaiting approval.</p>";
                 } else {
-                    let html = `<table><tr><th style="width:14%">Target & Spec</th><th style="width:38%">Candidate Prompt to Wire</th><th style="width:36%">Evaluator Diagnosis (Audit Model)</th><th style="width:12%">Action</th></tr>`;
+                    let html = `<table><tr><th style="width:14%">Target & Spec</th><th style="width:38%">Candidate Payload</th><th style="width:36%">Evaluator Diagnosis (Audit Model)</th><th style="width:12%">Action</th></tr>`;
                     data.queue.forEach(item => {
                         let badgeClass = item.certainty === 'high_certainty_clean' ? 'badge-clean' : (item.certainty === 'uncertain' ? 'badge-uncertain' : (item.certainty === 'decoy' ? 'badge-decoy' : 'badge-leak'));
                         let placeholderText = item.certainty === 'high_certainty_clean' ? "Auditor found no leaks. Add manual feedback here to force a rewrite..." : "Auditor flagged issues. Edit notes before pushing to rewrite...";
@@ -304,7 +308,7 @@
                                     <button class="btn-copy" onclick="copyText(this, 'q-pre-${item.id}')">📋 Copy</button>
                                     <pre id="q-pre-${item.id}">${escapeHtml(item.prompt_text)}</pre>
                                 </div>
-                                <button class="btn-action btn-edit" onclick="editRequest('${item.id}')" style="margin-top:8px;">✏️ Quick-Edit Payload Before Sending</button>
+                                <button class="btn-action btn-edit" onclick="editRequest('${item.id}')">✏️ Quick-Edit Payload Before Dispatch</button>
                             </td>
                             <td>
                                 <div class="evaluator-box">
@@ -319,7 +323,7 @@
                             </td>
                             <td>
                                 <button class="btn-action btn-approve" onclick="resolve('${item.id}', 'approve')">Approve</button>
-                                <button class="btn-action btn-feedback" onclick="resolve('${item.id}', 'feedback')">🔄 Send Feedback & Rewrite</button>
+                                ${item.spec_type !== 'assembly' ? `<button class="btn-action btn-feedback" onclick="resolve('${item.id}', 'feedback')">🔄 Send Feedback & Rewrite</button>` : ''}
                                 <button class="btn-action btn-reject" onclick="resolve('${item.id}', 'reject')">Reject</button>
                             </td>
                         </tr>`;
@@ -382,33 +386,18 @@
                         let certBadge = sub.certainty !== 'N/A' ? `<span class="badge ${sub.certainty === 'high_certainty_clean' ? 'badge-clean' : (sub.certainty === 'decoy' ? 'badge-decoy' : 'badge-uncertain')}">${sub.certainty}</span>` : '';
                         let tokStr = sub.total_tokens > 0 ? `<span class="token-pill">${sub.prompt_tokens}↓ + ${sub.completion_tokens}↑ = ${sub.total_tokens}</span>` : "";
 
-                        const regenBtn = (sub.phase_type === 'LOCAL_ASSEMBLY' || sub.phase_type === 'LOCAL_ASSEMBLY_REGEN') ? `<button class="btn-edit" onclick="showRegenModal('${turn.turn_id}', '${sub.id}')" style="margin-left:8px;">🔄 Regenerate Output</button>` : '';
-
                         htmlStrAll += `
                             <div class="timeline-step ${isDecoy ? 'decoy-node' : (isExt ? '' : 'local-node')}">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
                                     <div><span class="badge ${badgeType}">Step ${sub.step_order}: ${sub.phase_type}</span><span style="font-size:12px; color:#94a3b8; margin-left:6px;">➔ ${escapeHtml(sub.target_engine)}</span></div>
                                     <div style="font-size:11px; color:#64748b; display:flex; align-items:center;">
                                         ${tokStr} Latency: ${sub.latency_ms > 0 ? sub.latency_ms + 'ms' : 'Gating'} | Status: <strong style="margin-left:4px;">${sub.status}</strong>
-                                        ${regenBtn}
                                     </div>
                                 </div>
                                 <table>
                                     <tr><th style="width:50%;">Inbound Prompt Payload</th><th style="width:50%;">Response / Diagnosis</th></tr>
                                     <tr>
-                                        <td>
-                                            <div style="position:relative;">
-                                                <button class="btn-copy" onclick="copyText(this, 'p-${sub.id}')">📋 Copy</button>
-                                                <pre id="p-${sub.id}">${escapeHtml(sub.prompt)}</pre>
-                                            </div>
-                                            <div id="regen-wrapper-${sub.id}" style="display:none; margin-top:8px;">
-                                                <textarea id="regen-text-${sub.id}" class="edit-area"></textarea>
-                                                <div style="display:flex; gap:8px; margin-top:6px;">
-                                                    <button class="btn-action btn-approve" style="width:auto; margin-bottom:0;" onclick="submitRegen('${turn.turn_id}', '${sub.id}')">Submit Regeneration</button>
-                                                    <button class="btn-action btn-reject" style="width:auto; margin-bottom:0;" onclick="document.getElementById('regen-wrapper-${sub.id}').style.display='none'">Cancel</button>
-                                                </div>
-                                            </div>
-                                        </td>
+                                        <td><div style="position:relative;"><button class="btn-copy" onclick="copyText(this, 'p-${sub.id}')">📋 Copy</button><pre id="p-${sub.id}">${escapeHtml(sub.prompt)}</pre></div></td>
                                         <td>
                                             ${sub.response ? `<div style="position:relative;"><button class="btn-copy" onclick="copyText(this, 'r-${sub.id}')">📋 Copy</button><pre id="r-${sub.id}">${escapeHtml(sub.response)}</pre></div>` : '<em style="color:#64748b;">(No response payload)</em>'}
                                             ${sub.audit_notes ? `<div class="sub-meta" style="margin-top:6px;">${certBadge} <strong>Audit:</strong>${escapeHtml(sub.audit_notes)}</div>` : ''}
@@ -478,7 +467,7 @@
             if (tab === 'tokens') { tokenPageSize = parseInt(document.getElementById('token-page-size-select').value); tokenPage = 1; fetchTokens(); }
         }
 
-        async function setPolicy(p) { await fetch('/api/policy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: p }) }); fetchQueueState(); }
+        async function setPolicy(p, target) { await fetch('/api/policy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policy: p, target: target }) }); fetchQueueState(); }
         async function setRoutingState(payload) { await fetch('/api/routing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); fetchQueueState(); }
         
         async function resolve(id, action) {
